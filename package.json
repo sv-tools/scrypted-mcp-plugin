@@ -1,0 +1,40 @@
+{
+  "name": "scrypted-mcp",
+  "version": "0.1.0",
+  "description": "Model Context Protocol server for Scrypted — lets AI assistants inspect logs, manage plugins, and query devices on a running Scrypted server.",
+  "license": "MIT",
+  "author": "Sergey Vilgelm <sergey@vilgelm.com>",
+  "type": "module",
+  "bin": {
+    "scrypted-mcp": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "prepublishOnly": "npm run build",
+    "fmt": "prettier --write \"src/**/*.ts\"",
+    "fmt:check": "prettier --check \"src/**/*.ts\"",
+    "lint": "eslint src",
+    "lint:fix": "eslint src --fix"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.18.0",
+    "@scrypted/client": "^1.3.26",
+    "@scrypted/types": "^0.5.55",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^24.12.2",
+    "eslint": "^10.2.1",
+    "prettier": "^3.8.3",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "typescript-eslint": "^8.59.1"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

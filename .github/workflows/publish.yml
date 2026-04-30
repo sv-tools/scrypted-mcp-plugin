@@ -1,0 +1,52 @@
+name: Publish
+
+on:
+  push:
+    # Trigger on semver tags like v1.0.7. Push the tag with `git tag v1.0.7 && git push --tags`
+    # after bumping the version in package.json.
+    tags: ['v*']
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # id-token is required for npm publish provenance — provenance signs the package
+      # via the GitHub OIDC token so consumers can verify it was built by this workflow.
+      id-token: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'npm'
+          # Configures npm with the registry URL so NODE_AUTH_TOKEN is honored at publish.
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Verify package.json version matches git tag
+        run: |
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::package.json version ($PKG_VERSION) does not match git tag ($TAG_VERSION)"
+            exit 1
+          fi
+          echo "Publishing scrypted-mcp@$PKG_VERSION"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Prettier check
+        run: npm run fmt:check
+
+      - name: ESLint
+        run: npm run lint
+
+      - name: Build (tsc)
+        run: npm run build
+
+      - name: Publish to npm
+        run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
