@@ -12,16 +12,14 @@ interface BackupComponent {
 // here (rather than in a description string) so the description and the check can't drift.
 const RESTORE_TRIPWIRE = 'RESTORE FROM BACKUP';
 
-// Hard ceiling on accepted restore payload size. A typical Scrypted backup is a few MB to
-// ~100MB; 500MB decoded is generous headroom for large camera/recording databases. Without
-// this, a buggy or malicious client could send a multi-GB base64 string and OOM the plugin
-// process before we even get to the elicitation prompt. Keeping the cap as a constant
-// (rather than configurable) for now — if a real restore needs more, bump this value or
-// promote it to a Settings entry.
-const MAX_RESTORE_BYTES = 500 * 1024 * 1024;
-// base64 inflates by 4/3 plus padding/whitespace slack. Reject the string before we even
-// allocate the decoded Buffer.
-const MAX_RESTORE_BASE64_LEN = Math.ceil((MAX_RESTORE_BYTES * 4) / 3) + 4;
+// Default ceiling on accepted restore payload size. A typical Scrypted backup is a few MB
+// to ~100MB; 500MB decoded is generous headroom for large camera/recording databases. The
+// limit is configurable via the plugin's Settings tab (max_restore_mb); this constant is
+// the default and lower bound used when the setting is missing or invalid. Without any
+// cap, a buggy or malicious client could send a multi-GB base64 string and OOM the plugin
+// before we even get to the elicitation prompt.
+export const DEFAULT_MAX_RESTORE_BYTES = 500 * 1024 * 1024;
+export const MIN_MAX_RESTORE_BYTES = 1024 * 1024; // 1MB floor — anything smaller is degenerate
 
 function timestampSlug() {
     return new Date().toISOString().replace(/[:.]/g, '-');
@@ -32,10 +30,13 @@ function timestampSlug() {
 // input. For a destructive `restore_backup` call we want the inverse: refuse early if the
 // input doesn't match RFC 4648 standard base64 verbatim (with padding), so we never stage
 // silently-truncated bytes and call `backup.restore()` on them.
-function strictBase64Decode(input: string): Buffer {
-    if (input.length > MAX_RESTORE_BASE64_LEN) {
+function strictBase64Decode(input: string, maxBytes: number): Buffer {
+    // base64 inflates by 4/3 plus padding/whitespace slack. Reject the string before we
+    // even allocate the decoded Buffer so a 5GB payload doesn't get materialized.
+    const maxBase64Len = Math.ceil((maxBytes * 4) / 3) + 4;
+    if (input.length > maxBase64Len) {
         throw new Error(
-            `backupBase64 length ${input.length} exceeds maximum of ${MAX_RESTORE_BASE64_LEN} (decoded cap ${MAX_RESTORE_BYTES} bytes)`,
+            `backupBase64 length ${input.length} exceeds maximum of ${maxBase64Len} (decoded cap ${maxBytes} bytes)`,
         );
     }
     if (!/^[A-Za-z0-9+/]*={0,2}$/.test(input)) {
@@ -46,10 +47,10 @@ function strictBase64Decode(input: string): Buffer {
     }
     const buf = Buffer.from(input, 'base64');
     // Belt-and-braces post-decode check. The base64 length cap above already gates the
-    // decoded size to within ~3 bytes, but a future change to MAX_RESTORE_BASE64_LEN could
-    // drift; this keeps the decoded-bytes invariant explicit.
-    if (buf.length > MAX_RESTORE_BYTES) {
-        throw new Error(`decoded backup is ${buf.length} bytes; maximum is ${MAX_RESTORE_BYTES}`);
+    // decoded size to within ~3 bytes, but the explicit byte-level guard keeps the
+    // invariant honest.
+    if (buf.length > maxBytes) {
+        throw new Error(`decoded backup is ${buf.length} bytes; maximum is ${maxBytes}`);
     }
     // Round-trip: re-encode and compare. Catches edge cases like trailing junk past padding
     // that the regex above lets through (e.g. "AAAA====" passes the char check but won't
@@ -110,9 +111,11 @@ export const restoreBackupInput = z.object({
         ),
 });
 
-// `restoreBackup` needs the live McpServer to issue an elicitation request mid-call. Returned
-// as a factory so the closure captures the server without leaking it as a global.
-export function makeRestoreBackupHandler(server: McpServer) {
+// `restoreBackup` needs the live McpServer to issue an elicitation request mid-call. The
+// `getMaxBytes` getter reads the configurable size cap from plugin settings on each call so
+// a Settings change applies on the next invocation without a reload. Returned as a factory
+// so the closure captures the server + getter without leaking them as globals.
+export function makeRestoreBackupHandler(server: McpServer, getMaxBytes: () => number) {
     return async function restoreBackup(args: z.infer<typeof restoreBackupInput>) {
         if (args.confirm !== RESTORE_TRIPWIRE)
             throw new Error(
@@ -123,7 +126,8 @@ export function makeRestoreBackupHandler(server: McpServer) {
         // do NOT stage a tmp file on the Scrypted host — the bytes already came from the
         // client, so re-uploading on a retry is cheap, and this avoids accumulating large
         // ZIPs in os.tmpdir() across failed/cancelled restore attempts.
-        const data = strictBase64Decode(args.backupBase64);
+        const maxBytes = Math.max(MIN_MAX_RESTORE_BYTES, Math.floor(getMaxBytes()) || DEFAULT_MAX_RESTORE_BYTES);
+        const data = strictBase64Decode(args.backupBase64, maxBytes);
         if (data.length === 0) throw new Error('backupBase64 decoded to zero bytes');
         const sha256 = createHash('sha256').update(data).digest('hex');
 

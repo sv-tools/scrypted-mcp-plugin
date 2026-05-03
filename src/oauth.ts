@@ -27,12 +27,20 @@ import {
 
 // --- Constants -------------------------------------------------------------
 
-const ACCESS_TOKEN_TTL_SEC = 60 * 60; // 1h
+// Access and refresh token TTLs are settings-driven now (see OAuthServiceOptions). These
+// constants stay as the single source of truth for the defaults (consumed by the plugin's
+// getSettings()) and as the floor / ceiling for sanity-clamping in respondWithTokens().
+export const DEFAULT_ACCESS_TOKEN_TTL_SEC = 60 * 60; // 1h
 // Refresh tokens are how an MCP client stays connected without re-running the browser-based
 // PKCE dance every hour. 30 days is the upper bound on how long a stolen RT remains useful;
 // the rotating-on-use store below is what makes that bound tolerable for a public PKCE
 // client. (Without rotation, a captured RT would be a 30-day password.)
-const REFRESH_TOKEN_TTL_SEC = 30 * 24 * 60 * 60; // 30d
+export const DEFAULT_REFRESH_TOKEN_TTL_SEC = 30 * 24 * 60 * 60; // 30d
+export const ACCESS_TOKEN_TTL_MIN_SEC = 60; // 1 minute floor — anything shorter is degenerate
+export const ACCESS_TOKEN_TTL_MAX_SEC = 24 * 60 * 60; // 1 day ceiling
+export const REFRESH_TOKEN_TTL_MIN_SEC = 60 * 60; // 1 hour floor
+export const REFRESH_TOKEN_TTL_MAX_SEC = 365 * 24 * 60 * 60; // 1 year ceiling
+
 const AUTH_CODE_TTL_MS = 60 * 1000; // 60s — codes are exchanged immediately by the client.
 const SUPPORTED_SCOPES = ['mcp'];
 
@@ -422,6 +430,16 @@ export interface OAuthServiceOptions {
     // Reads the configured DCR client cap from plugin storage. Called per /register so a
     // settings change applies on the next registration without a plugin reload.
     getMaxClients: () => number;
+    // Token-lifetime getters. Called once per token issuance so a Settings change takes
+    // effect on the next /token response without a plugin reload. Both getters are clamped
+    // to safe ranges in respondWithTokens.
+    getAccessTokenTtlSec: () => number;
+    getRefreshTokenTtlSec: () => number;
+}
+
+function clamp(value: number, min: number, max: number, fallback: number): number {
+    if (!Number.isFinite(value)) return fallback;
+    return Math.max(min, Math.min(max, Math.floor(value)));
 }
 
 // How often the expired-RT sweeper runs. 30 minutes is short enough that storage doesn't
@@ -435,6 +453,8 @@ export class OAuthService {
     private refreshTokens: RefreshTokenStore;
     private signing: Promise<SigningKey>;
     private console: ConsoleLike;
+    private getAccessTokenTtlSec: () => number;
+    private getRefreshTokenTtlSec: () => number;
 
     constructor(opts: OAuthServiceOptions) {
         this.console = opts.console;
@@ -442,6 +462,8 @@ export class OAuthService {
         this.clients = new ClientStore(opts.storage, opts.getMaxClients, opts.console);
         this.refreshTokens = new RefreshTokenStore(opts.storage, opts.console);
         this.signing = loadOrCreateSigningKey(opts.storage);
+        this.getAccessTokenTtlSec = opts.getAccessTokenTtlSec;
+        this.getRefreshTokenTtlSec = opts.getRefreshTokenTtlSec;
         // Fire-and-forget the periodic RT cleanup. unref() so the timer doesn't keep the
         // event loop alive on its own (in-process plugin runs forever anyway, but unref is
         // the polite default).
@@ -1071,12 +1093,27 @@ export class OAuthService {
         const ep = this.endpoints(req);
         const key = await this.signing;
         const now = Math.floor(Date.now() / 1000);
+        // Read TTLs at issuance time so a Settings change takes effect on the next grant
+        // without a reload. Clamp to sane bounds — a misconfigured "0" or negative value
+        // would otherwise immediately invalidate every token we mint.
+        const accessTtl = clamp(
+            this.getAccessTokenTtlSec(),
+            ACCESS_TOKEN_TTL_MIN_SEC,
+            ACCESS_TOKEN_TTL_MAX_SEC,
+            DEFAULT_ACCESS_TOKEN_TTL_SEC,
+        );
+        const refreshTtl = clamp(
+            this.getRefreshTokenTtlSec(),
+            REFRESH_TOKEN_TTL_MIN_SEC,
+            REFRESH_TOKEN_TTL_MAX_SEC,
+            DEFAULT_REFRESH_TOKEN_TTL_SEC,
+        );
         const accessToken = await signJwt(key, {
             iss: ep.issuer,
             sub: seed.sub,
             aud: ep.resource,
             iat: now,
-            exp: now + ACCESS_TOKEN_TTL_SEC,
+            exp: now + accessTtl,
             scope: seed.scope,
             client_id: seed.clientId,
         });
@@ -1085,7 +1122,7 @@ export class OAuthService {
             sub: seed.sub,
             scope: seed.scope,
             issuedAt: now,
-            expiresAt: now + REFRESH_TOKEN_TTL_SEC,
+            expiresAt: now + refreshTtl,
         });
         // Touch the LRU stamp on every successful grant so the client doesn't get evicted
         // mid-session by a /register burst from a different client.
@@ -1095,8 +1132,8 @@ export class OAuthService {
             seed.sub,
             seed.clientId,
             ep.resource,
-            now + ACCESS_TOKEN_TTL_SEC,
-            now + REFRESH_TOKEN_TTL_SEC,
+            now + accessTtl,
+            now + refreshTtl,
         );
         sendJson(
             res,
@@ -1104,7 +1141,7 @@ export class OAuthService {
             {
                 access_token: accessToken,
                 token_type: 'Bearer',
-                expires_in: ACCESS_TOKEN_TTL_SEC,
+                expires_in: accessTtl,
                 scope: seed.scope,
                 refresh_token: refreshToken,
             },

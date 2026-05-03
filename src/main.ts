@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
-import {
+import sdk, {
     ScryptedDeviceBase,
     ScryptedInterface,
     type HttpRequest,
@@ -12,7 +12,15 @@ import {
     type Settings,
 } from '@scrypted/sdk';
 import { fromWebResponse, sendJson, sendText, toWebRequest } from './http-bridge';
-import { OAuthService } from './oauth';
+import {
+    ACCESS_TOKEN_TTL_MAX_SEC,
+    ACCESS_TOKEN_TTL_MIN_SEC,
+    DEFAULT_ACCESS_TOKEN_TTL_SEC,
+    DEFAULT_REFRESH_TOKEN_TTL_SEC,
+    OAuthService,
+    REFRESH_TOKEN_TTL_MAX_SEC,
+    REFRESH_TOKEN_TTL_MIN_SEC,
+} from './oauth';
 import {
     clearAlerts,
     clearAlertsInput,
@@ -118,7 +126,11 @@ function wrap<TArgs, TResult>(handler: (args: TArgs) => Promise<TResult>, opts: 
 // session because Server.connect(transport) binds a server to one transport, and each
 // session has its own transport instance. Session lifetime is short — until the client
 // closes the connection or sends DELETE — so the per-session allocation cost is fine.
-function createMcpServer(): McpServer {
+//
+// `getMaxRestoreBytes` is plumbed through so tools that need access to plugin settings
+// (currently just restore_backup) can read the live value without coupling to the plugin
+// instance directly.
+function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
     const server = new McpServer(
         { name: 'scrypted-mcp', version: '0.4.1' },
         {
@@ -564,7 +576,7 @@ function createMcpServer(): McpServer {
                 openWorldHint: false,
             },
         },
-        wrap(makeRestoreBackupHandler(server)),
+        wrap(makeRestoreBackupHandler(server, getMaxRestoreBytes)),
     );
 
     return server;
@@ -588,7 +600,30 @@ const SESSION_SWEEP_INTERVAL_MS = 10 * 60 * 1000; // 10min
 // Plugin settings. Persisted in plugin storage (so they survive reloads) under the keys
 // declared here; surfaced via getSettings() / putSetting() in the Scrypted UI.
 const STORAGE_KEY_DCR_MAX_CLIENTS = 'settings.dcr_max_clients';
+const STORAGE_KEY_ACCESS_TOKEN_TTL_SEC = 'settings.access_token_ttl_sec';
+const STORAGE_KEY_REFRESH_TOKEN_TTL_SEC = 'settings.refresh_token_ttl_sec';
+const STORAGE_KEY_MAX_RESTORE_MB = 'settings.max_restore_mb';
 const DEFAULT_DCR_MAX_CLIENTS = 100;
+const DEFAULT_MAX_RESTORE_MB = 500;
+const MIN_MAX_RESTORE_MB = 1;
+const MAX_MAX_RESTORE_MB = 10240; // 10GB ceiling
+
+// Reads a positive-integer setting from plugin storage. Returns the default when the value
+// is missing, malformed, or out of range — settings should never be able to brick the
+// plugin no matter what the operator typed in.
+function readIntegerSetting(
+    storage: Pick<Storage, 'getItem'>,
+    key: string,
+    def: number,
+    min: number,
+    max: number,
+): number {
+    const raw = storage.getItem(key);
+    if (!raw) return def;
+    const n = Number.parseInt(raw, 10);
+    if (!Number.isFinite(n) || n < min || n > max) return def;
+    return n;
+}
 
 interface SessionEntry {
     transport: WebStandardStreamableHTTPServerTransport;
@@ -606,6 +641,8 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
             storage: this.storage,
             console: this.console,
             getMaxClients: () => this.getDcrMaxClients(),
+            getAccessTokenTtlSec: () => this.getAccessTokenTtlSec(),
+            getRefreshTokenTtlSec: () => this.getRefreshTokenTtlSec(),
         });
         this.console.log('[scrypted-mcp] ready. MCP endpoint: <scrypted-host>/endpoint/<package-name>/public/mcp');
         this.console.log(
@@ -615,15 +652,76 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
     }
 
     private getDcrMaxClients(): number {
-        const raw = this.storage.getItem(STORAGE_KEY_DCR_MAX_CLIENTS);
-        if (!raw) return DEFAULT_DCR_MAX_CLIENTS;
-        const n = Number.parseInt(raw, 10);
-        return Number.isFinite(n) && n > 0 ? n : DEFAULT_DCR_MAX_CLIENTS;
+        return readIntegerSetting(
+            this.storage,
+            STORAGE_KEY_DCR_MAX_CLIENTS,
+            DEFAULT_DCR_MAX_CLIENTS,
+            1,
+            Number.MAX_SAFE_INTEGER,
+        );
+    }
+
+    private getAccessTokenTtlSec(): number {
+        return readIntegerSetting(
+            this.storage,
+            STORAGE_KEY_ACCESS_TOKEN_TTL_SEC,
+            DEFAULT_ACCESS_TOKEN_TTL_SEC,
+            ACCESS_TOKEN_TTL_MIN_SEC,
+            ACCESS_TOKEN_TTL_MAX_SEC,
+        );
+    }
+
+    private getRefreshTokenTtlSec(): number {
+        return readIntegerSetting(
+            this.storage,
+            STORAGE_KEY_REFRESH_TOKEN_TTL_SEC,
+            DEFAULT_REFRESH_TOKEN_TTL_SEC,
+            REFRESH_TOKEN_TTL_MIN_SEC,
+            REFRESH_TOKEN_TTL_MAX_SEC,
+        );
+    }
+
+    private getMaxRestoreMb(): number {
+        return readIntegerSetting(
+            this.storage,
+            STORAGE_KEY_MAX_RESTORE_MB,
+            DEFAULT_MAX_RESTORE_MB,
+            MIN_MAX_RESTORE_MB,
+            MAX_MAX_RESTORE_MB,
+        );
+    }
+
+    private getMaxRestoreBytes(): number {
+        return this.getMaxRestoreMb() * 1024 * 1024;
+    }
+
+    // Read-only display: build the URL clients should connect to. Wraps the SDK's
+    // getLocalEndpoint in a try/catch so a misconfigured local discovery doesn't strand the
+    // Settings panel — the field just shows a placeholder if it's not available.
+    private async getMcpEndpointUrl(): Promise<string> {
+        try {
+            const base = await sdk.endpointManager.getLocalEndpoint(this.nativeId, { public: true });
+            // getLocalEndpoint returns the public/ root; append our /mcp path.
+            return base.endsWith('/') ? `${base}mcp` : `${base}/mcp`;
+        } catch (e) {
+            this.console.error('[scrypted-mcp] getMcpEndpointUrl failed:', e);
+            return '(unavailable — see plugin logs)';
+        }
     }
 
     async getSettings(): Promise<Setting[]> {
         const stats = this.oauth.getStats();
+        const endpoint = await this.getMcpEndpointUrl();
         return [
+            {
+                key: 'mcp_endpoint',
+                title: 'MCP endpoint URL',
+                description: 'The URL to configure in your MCP client (Claude Desktop, Claude Code, etc.).',
+                type: 'string',
+                group: 'Endpoint',
+                readonly: true,
+                value: endpoint,
+            },
             {
                 key: 'dcr_max_clients',
                 title: 'Maximum DCR client registrations',
@@ -636,6 +734,46 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
                 type: 'integer',
                 group: 'Configuration',
                 value: this.getDcrMaxClients(),
+            },
+            {
+                key: 'access_token_ttl_sec',
+                title: 'Access token TTL (seconds)',
+                description: [
+                    'Lifetime of issued JWT access tokens.',
+                    'Shorter values force more frequent refreshes (tighter security);',
+                    'longer values reduce auth churn.',
+                    `Range ${ACCESS_TOKEN_TTL_MIN_SEC}–${ACCESS_TOKEN_TTL_MAX_SEC}, default ${DEFAULT_ACCESS_TOKEN_TTL_SEC} (1h).`,
+                ].join(' '),
+                type: 'integer',
+                group: 'Configuration',
+                range: [ACCESS_TOKEN_TTL_MIN_SEC, ACCESS_TOKEN_TTL_MAX_SEC],
+                value: this.getAccessTokenTtlSec(),
+            },
+            {
+                key: 'refresh_token_ttl_sec',
+                title: 'Refresh token TTL (seconds)',
+                description: [
+                    'Lifetime of issued refresh tokens.',
+                    'Each refresh rotates the token (single-use), so this is the upper bound on how long a stolen RT remains valid before re-auth is forced.',
+                    `Range ${REFRESH_TOKEN_TTL_MIN_SEC}–${REFRESH_TOKEN_TTL_MAX_SEC}, default ${DEFAULT_REFRESH_TOKEN_TTL_SEC} (30d).`,
+                ].join(' '),
+                type: 'integer',
+                group: 'Configuration',
+                range: [REFRESH_TOKEN_TTL_MIN_SEC, REFRESH_TOKEN_TTL_MAX_SEC],
+                value: this.getRefreshTokenTtlSec(),
+            },
+            {
+                key: 'max_restore_mb',
+                title: 'Max restore size (MB)',
+                description: [
+                    'Maximum decoded backup size that restore_backup will accept.',
+                    'Bump this if your Scrypted database exceeds the default;',
+                    `range ${MIN_MAX_RESTORE_MB}–${MAX_MAX_RESTORE_MB} MB, default ${DEFAULT_MAX_RESTORE_MB} MB.`,
+                ].join(' '),
+                type: 'integer',
+                group: 'Configuration',
+                range: [MIN_MAX_RESTORE_MB, MAX_MAX_RESTORE_MB],
+                value: this.getMaxRestoreMb(),
             },
             {
                 key: 'active_sessions',
@@ -681,9 +819,25 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
 
     async putSetting(key: string, value: SettingValue): Promise<void> {
         if (key === 'dcr_max_clients') {
-            const n = Number(value);
-            if (!Number.isFinite(n) || n <= 0) throw new Error('dcr_max_clients must be a positive number');
-            this.storage.setItem(STORAGE_KEY_DCR_MAX_CLIENTS, String(Math.floor(n)));
+            this.writeIntegerSetting(key, value, STORAGE_KEY_DCR_MAX_CLIENTS, 1, Number.MAX_SAFE_INTEGER);
+        } else if (key === 'access_token_ttl_sec') {
+            this.writeIntegerSetting(
+                key,
+                value,
+                STORAGE_KEY_ACCESS_TOKEN_TTL_SEC,
+                ACCESS_TOKEN_TTL_MIN_SEC,
+                ACCESS_TOKEN_TTL_MAX_SEC,
+            );
+        } else if (key === 'refresh_token_ttl_sec') {
+            this.writeIntegerSetting(
+                key,
+                value,
+                STORAGE_KEY_REFRESH_TOKEN_TTL_SEC,
+                REFRESH_TOKEN_TTL_MIN_SEC,
+                REFRESH_TOKEN_TTL_MAX_SEC,
+            );
+        } else if (key === 'max_restore_mb') {
+            this.writeIntegerSetting(key, value, STORAGE_KEY_MAX_RESTORE_MB, MIN_MAX_RESTORE_MB, MAX_MAX_RESTORE_MB);
         } else if (key === 'revoke_all') {
             const counts = await this.oauth.revokeAll();
             const closed = this.closeAllSessions();
@@ -693,8 +847,13 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
                 counts.refreshTokens,
                 closed,
             );
-        } else if (key === 'active_sessions' || key === 'registered_clients' || key === 'active_refresh_tokens') {
-            // Read-only stats — no-op; the UI may round-trip the value on save.
+        } else if (
+            key === 'mcp_endpoint' ||
+            key === 'active_sessions' ||
+            key === 'registered_clients' ||
+            key === 'active_refresh_tokens'
+        ) {
+            // Read-only fields — no-op; the UI may round-trip the value on save.
             return;
         } else {
             throw new Error(`unknown setting: ${key}`);
@@ -702,6 +861,16 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
         // Tell Scrypted the device's settings changed so the UI re-fetches via getSettings().
         // For revoke_all this also surfaces the freshly-zeroed stats.
         await this.onDeviceEvent(ScryptedInterface.Settings, undefined);
+    }
+
+    // Validate + persist an integer setting. Centralised so every numeric setting gets the
+    // same range check and "must be a positive integer" error message.
+    private writeIntegerSetting(key: string, value: SettingValue, storageKey: string, min: number, max: number): void {
+        const n = Number(value);
+        if (!Number.isFinite(n) || n < min || n > max) {
+            throw new Error(`${key} must be an integer between ${min} and ${max}, got ${String(value)}`);
+        }
+        this.storage.setItem(storageKey, String(Math.floor(n)));
     }
 
     // Tear down every live MCP session. Used by the revoke_all button. The transports'
@@ -835,7 +1004,7 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
                 this.sessions.delete(sid);
             },
         });
-        const server = createMcpServer();
+        const server = createMcpServer(() => this.getMaxRestoreBytes());
         const entry: SessionEntry = { transport, server, lastSeen: Date.now() };
         entryRef.current = entry;
         transport.onclose = () => {
