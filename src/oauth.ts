@@ -28,6 +28,11 @@ import {
 // --- Constants -------------------------------------------------------------
 
 const ACCESS_TOKEN_TTL_SEC = 60 * 60; // 1h
+// Refresh tokens are how an MCP client stays connected without re-running the browser-based
+// PKCE dance every hour. 30 days is the upper bound on how long a stolen RT remains useful;
+// the rotating-on-use store below is what makes that bound tolerable for a public PKCE
+// client. (Without rotation, a captured RT would be a 30-day password.)
+const REFRESH_TOKEN_TTL_SEC = 30 * 24 * 60 * 60; // 30d
 const AUTH_CODE_TTL_MS = 60 * 1000; // 60s — codes are exchanged immediately by the client.
 const SUPPORTED_SCOPES = ['mcp'];
 
@@ -35,6 +40,7 @@ const SUPPORTED_SCOPES = ['mcp'];
 // might persist later.
 const STORAGE_KEY_SIGNING_JWK = 'oauth.signing_jwk';
 const STORAGE_KEY_CLIENT_PREFIX = 'oauth.client.';
+const STORAGE_KEY_REFRESH_TOKEN_PREFIX = 'oauth.rt.';
 
 // --- Types -----------------------------------------------------------------
 
@@ -58,6 +64,21 @@ interface PendingAuthCode {
     scope: string;
     resource?: string;
     expiresAt: number;
+}
+
+interface RefreshTokenRecord {
+    // The opaque refresh token string. Also used as the storage subkey suffix.
+    token: string;
+    client_id: string;
+    // Username at issuance time. We do NOT re-check admin status on refresh — the chain
+    // inherits the /authorize-time admin check. Implication: 30-day TTL is the implicit
+    // revocation window if an admin's privileges are revoked. Plugin storage wipe is the
+    // hard-revoke escape hatch.
+    sub: string;
+    scope: string;
+    resource?: string;
+    issuedAt: number; // unix sec
+    expiresAt: number; // unix sec
 }
 
 // Scrypted's Storage interface is the synchronous DOM Storage shape (string in, string out).
@@ -223,6 +244,51 @@ class AuthCodeStore {
     }
 }
 
+// Refresh tokens are persisted to plugin storage so they survive plugin reloads (otherwise a
+// reload mid-session would silently invalidate every refresh chain). One key per token; the
+// storage value is the JSON record.
+//
+// Rotation: every consume() deletes the record before returning it, and the caller is
+// expected to issue a fresh one. Two presentations of the same RT will see at most one hit
+// — the second presentation (whether from a network retry by the legitimate client, or a
+// thief who captured the RT after the legit client already used it) just looks like an
+// invalid_grant. The legitimate client then re-runs PKCE, which surfaces the breach to the
+// user. This is the OAuth 2.1 §4.3.1 / RFC 6749 §10.4 recommendation, simplified — we don't
+// track replacement chains, so we can't proactively revoke the entire chain on detection;
+// the natural "re-auth on failure" loop is the best we offer at v1.
+class RefreshTokenStore {
+    constructor(
+        private storage: StorageLike,
+        private console: ConsoleLike,
+    ) {}
+
+    issue(seed: Omit<RefreshTokenRecord, 'token'>): string {
+        const token = base64urlNoPad(randomBytes(32));
+        const record: RefreshTokenRecord = { token, ...seed };
+        this.storage.setItem(STORAGE_KEY_REFRESH_TOKEN_PREFIX + token, JSON.stringify(record));
+        return token;
+    }
+
+    // Returns the record only if found, valid, and bound to the submitted client_id. Always
+    // deletes the record on first sight — caller is responsible for issuing a replacement.
+    consume(token: string, clientId: string): RefreshTokenRecord | undefined {
+        const key = STORAGE_KEY_REFRESH_TOKEN_PREFIX + token;
+        const raw = this.storage.getItem(key);
+        if (!raw) return undefined;
+        this.storage.removeItem(key);
+        let record: RefreshTokenRecord;
+        try {
+            record = JSON.parse(raw) as RefreshTokenRecord;
+        } catch {
+            this.console.error('[oauth] refresh token record corrupt for prefix=%s', token.slice(0, 6));
+            return undefined;
+        }
+        if (record.client_id !== clientId) return undefined;
+        if (record.expiresAt <= Math.floor(Date.now() / 1000)) return undefined;
+        return record;
+    }
+}
+
 // --- Signing key -----------------------------------------------------------
 
 async function loadOrCreateSigningKey(storage: StorageLike): Promise<SigningKey> {
@@ -252,11 +318,13 @@ export interface OAuthServiceOptions {
 export class OAuthService {
     private clients: ClientStore;
     private codes = new AuthCodeStore();
+    private refreshTokens: RefreshTokenStore;
     private signing: Promise<SigningKey>;
     private console: ConsoleLike;
 
     constructor(opts: OAuthServiceOptions) {
         this.clients = new ClientStore(opts.storage);
+        this.refreshTokens = new RefreshTokenStore(opts.storage, opts.console);
         this.signing = loadOrCreateSigningKey(opts.storage);
         this.console = opts.console;
     }
@@ -418,7 +486,7 @@ export class OAuthService {
             registration_endpoint: ep.registration_endpoint,
             jwks_uri: ep.jwks_uri,
             response_types_supported: ['code'],
-            grant_types_supported: ['authorization_code'],
+            grant_types_supported: ['authorization_code', 'refresh_token'],
             code_challenge_methods_supported: ['S256'],
             token_endpoint_auth_methods_supported: ['none'],
             scopes_supported: SUPPORTED_SCOPES,
@@ -438,7 +506,7 @@ export class OAuthService {
             registration_endpoint: ep.registration_endpoint,
             jwks_uri: ep.jwks_uri,
             response_types_supported: ['code'],
-            grant_types_supported: ['authorization_code'],
+            grant_types_supported: ['authorization_code', 'refresh_token'],
             code_challenge_methods_supported: ['S256'],
             token_endpoint_auth_methods_supported: ['none'],
             scopes_supported: SUPPORTED_SCOPES,
@@ -628,6 +696,9 @@ export class OAuthService {
 
     // --- Token endpoint ---------------------------------------------------
 
+    // Dispatcher. Splits authorization_code (initial grant) and refresh_token (rotating
+    // re-authentication for an already-paired client) into separate handlers — the two
+    // share enough validation to confuse the trace if they're inlined together.
     private async handleToken(req: HttpRequest, res: HttpResponse) {
         if ((req.method ?? 'GET').toUpperCase() !== 'POST') {
             this.console.error('[oauth] /token reject: method_not_allowed', req.method);
@@ -636,11 +707,19 @@ export class OAuthService {
         }
         const body = parseBody(req.body);
         const grantType = asString(body.grant_type);
-        if (grantType !== 'authorization_code') {
-            this.console.error('[oauth] /token reject: unsupported_grant_type', grantType);
-            sendJson(res, 400, { error: 'unsupported_grant_type' });
+        if (grantType === 'authorization_code') {
+            await this.handleAuthorizationCodeGrant(req, res, body);
             return;
         }
+        if (grantType === 'refresh_token') {
+            await this.handleRefreshTokenGrant(req, res, body);
+            return;
+        }
+        this.console.error('[oauth] /token reject: unsupported_grant_type', grantType);
+        sendJson(res, 400, { error: 'unsupported_grant_type' });
+    }
+
+    private async handleAuthorizationCodeGrant(req: HttpRequest, res: HttpResponse, body: Record<string, unknown>) {
         const code = asString(body.code);
         const codeVerifier = asString(body.code_verifier);
         const clientId = asString(body.client_id);
@@ -700,28 +779,111 @@ export class OAuthService {
             return;
         }
 
+        await this.respondWithTokens(req, res, {
+            sub: pending.username,
+            scope: pending.scope,
+            clientId,
+            resource: pending.resource,
+        });
+    }
+
+    private async handleRefreshTokenGrant(req: HttpRequest, res: HttpResponse, body: Record<string, unknown>) {
+        const refreshToken = asString(body.refresh_token);
+        const clientId = asString(body.client_id);
+        if (!refreshToken || !clientId) {
+            this.console.error(
+                '[oauth] /token refresh reject: invalid_request — has refresh_token=%s client_id=%s',
+                !!refreshToken,
+                !!clientId,
+            );
+            sendJson(res, 400, { error: 'invalid_request' });
+            return;
+        }
+        const client = this.clients.get(clientId);
+        if (!client) {
+            this.console.error('[oauth] /token refresh reject: invalid_client (unknown client_id=%s)', clientId);
+            sendJson(res, 401, { error: 'invalid_client' });
+            return;
+        }
+        const record = this.refreshTokens.consume(refreshToken, clientId);
+        if (!record) {
+            // Could be: expired, never existed, replayed (already consumed by previous use),
+            // or bound to a different client_id. We deliberately don't distinguish — the
+            // client just re-runs PKCE.
+            this.console.error(
+                '[oauth] /token refresh reject: invalid_grant — refresh_token unknown / expired / wrong client (client_id=%s)',
+                clientId,
+            );
+            sendJson(res, 400, { error: 'invalid_grant', error_description: 'refresh_token invalid or expired' });
+            return;
+        }
+        // RFC 6749 §6 lets the client request a *narrower* scope on refresh. We accept any
+        // subset of the original; anything else gets rejected so a buggy client doesn't
+        // silently lose authorization it thought it kept.
+        let scope = record.scope;
+        const requestedScope = asString(body.scope);
+        if (requestedScope) {
+            const requestedSet = requestedScope.split(/\s+/).filter(Boolean);
+            const originalSet = new Set(record.scope.split(/\s+/).filter(Boolean));
+            if (!requestedSet.every(s => originalSet.has(s)) || requestedSet.length === 0) {
+                sendJson(res, 400, {
+                    error: 'invalid_scope',
+                    error_description: 'requested scope must be a non-empty subset of the original grant',
+                });
+                return;
+            }
+            scope = requestedSet.join(' ');
+        }
+        await this.respondWithTokens(req, res, {
+            sub: record.sub,
+            scope,
+            clientId,
+            resource: record.resource,
+        });
+    }
+
+    // Issues a fresh access_token + refresh_token pair. Used by both the authorization_code
+    // and refresh_token grants. Refresh tokens are rotating: every issuance produces a new
+    // RT, and the previous one was already deleted by RefreshTokenStore.consume(). The
+    // client must store the new `refresh_token` from each /token response.
+    //
+    // We do NOT re-check whether the user is still a Scrypted admin here — admin status is
+    // validated at /authorize, and the refresh chain inherits that decision until the 30-day
+    // TTL elapses. If you need to hard-revoke a chain, wipe the plugin's storage (signing
+    // key + DCR registrations + RTs all live there).
+    private async respondWithTokens(
+        req: HttpRequest,
+        res: HttpResponse,
+        seed: { sub: string; scope: string; clientId: string; resource?: string },
+    ) {
         const ep = this.endpoints(req);
         const key = await this.signing;
         const now = Math.floor(Date.now() / 1000);
         const accessToken = await signJwt(key, {
             iss: ep.issuer,
-            sub: pending.username,
+            sub: seed.sub,
             aud: ep.resource,
             iat: now,
             exp: now + ACCESS_TOKEN_TTL_SEC,
-            scope: pending.scope,
-            client_id: clientId,
+            scope: seed.scope,
+            client_id: seed.clientId,
         });
-
+        const refreshToken = this.refreshTokens.issue({
+            client_id: seed.clientId,
+            sub: seed.sub,
+            scope: seed.scope,
+            resource: seed.resource,
+            issuedAt: now,
+            expiresAt: now + REFRESH_TOKEN_TTL_SEC,
+        });
         this.console.log(
-            '[oauth] /token issued user=%s client_id=%s iss=%s aud=%s exp=%d',
-            pending.username,
-            clientId,
-            ep.issuer,
+            '[oauth] /token issued user=%s client_id=%s aud=%s access_exp=%d refresh_exp=%d',
+            seed.sub,
+            seed.clientId,
             ep.resource,
             now + ACCESS_TOKEN_TTL_SEC,
+            now + REFRESH_TOKEN_TTL_SEC,
         );
-
         sendJson(
             res,
             200,
@@ -729,7 +891,8 @@ export class OAuthService {
                 access_token: accessToken,
                 token_type: 'Bearer',
                 expires_in: ACCESS_TOKEN_TTL_SEC,
-                scope: pending.scope,
+                scope: seed.scope,
+                refresh_token: refreshToken,
             },
             { 'Cache-Control': 'no-store', Pragma: 'no-cache' },
         );

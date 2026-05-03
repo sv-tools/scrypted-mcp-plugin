@@ -21,6 +21,7 @@ The plugin is its own OAuth 2.1 Authorization Server. It supports:
 - **Dynamic Client Registration** (RFC 7591) — your MCP client registers itself the first time it connects; no manual config needed.
 - **Authorization Code + PKCE** (S256) — the only supported flow. Public clients only, no `client_secret`.
 - **ES256 JWT access tokens**, valid 1 hour, signed with an EC P-256 key generated on the plugin's first boot and persisted in plugin storage.
+- **Rotating refresh tokens**, valid 30 days. Every `/token` response includes a fresh `refresh_token`; redeeming one invalidates the previous, so a stolen RT works at most once before the legitimate client's next refresh fails and forces re-auth (surfacing the breach). Refresh tokens persist in plugin storage; wipe it to hard-revoke every chain.
 
 The login step is just **your existing Scrypted session**. When the MCP client opens `/authorize` in your browser, Scrypted's auth pipeline checks the cookie and populates the username for us. Auto-approve happens immediately — no consent screen.
 
