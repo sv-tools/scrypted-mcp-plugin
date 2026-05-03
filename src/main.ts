@@ -566,9 +566,25 @@ function createMcpServer(): McpServer {
 //   - the OAuth AS state (signing key, DCR registrations) — persisted in plugin storage
 //   - the live MCP session map keyed by Mcp-Session-Id
 //   - inbound request dispatch to the right handler
+// Idle session reaper. The Streamable HTTP transport only fires onsessionclosed when the
+// client sends DELETE or its socket faults — clients that just stop calling leak entries
+// indefinitely. We stamp lastSeen on every request and sweep periodically. The TTL matches
+// the access-token lifetime: any session idle for that long either has an expired token (so
+// the next request would re-auth and create a fresh session anyway) or is genuinely
+// abandoned. The sweep interval is short enough to keep the map bounded in practice without
+// burning CPU.
+const SESSION_IDLE_TTL_MS = 60 * 60 * 1000; // 1h
+const SESSION_SWEEP_INTERVAL_MS = 10 * 60 * 1000; // 10min
+
+interface SessionEntry {
+    transport: WebStandardStreamableHTTPServerTransport;
+    server: McpServer;
+    lastSeen: number;
+}
+
 class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler {
     private oauth: OAuthService;
-    private sessions = new Map<string, { transport: WebStandardStreamableHTTPServerTransport; server: McpServer }>();
+    private sessions = new Map<string, SessionEntry>();
 
     constructor(nativeId?: string) {
         super(nativeId);
@@ -577,6 +593,24 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
         this.console.log(
             '[scrypted-mcp] OAuth metadata at the same /public/.well-known/oauth-protected-resource path.',
         );
+        setInterval(() => this.sweepIdleSessions(), SESSION_SWEEP_INTERVAL_MS).unref();
+    }
+
+    private sweepIdleSessions(): void {
+        const now = Date.now();
+        for (const [sid, entry] of this.sessions) {
+            if (now - entry.lastSeen <= SESSION_IDLE_TTL_MS) continue;
+            // Best-effort transport teardown. The transport's onclose handler removes the
+            // entry from the map, but we delete here too in case close() is a no-op or
+            // throws — the goal is to bound the map regardless.
+            try {
+                entry.transport.close();
+            } catch {
+                // closing an already-closed transport is fine
+            }
+            this.sessions.delete(sid);
+            this.console.log('[scrypted-mcp] reaped idle session sid=%s idleMs=%d', sid, now - entry.lastSeen);
+        }
     }
 
     async onRequest(req: HttpRequest, res: HttpResponse): Promise<void> {
@@ -630,6 +664,10 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
         const sessionId = req.headers?.['mcp-session-id'];
         let entry = sessionId ? this.sessions.get(sessionId) : undefined;
         if (!entry) entry = await this.createSession();
+        // Stamp activity so the idle reaper doesn't evict an active session. Updates both
+        // the just-created and the looked-up entry — the latter is the load-bearing case
+        // (otherwise long-lived sessions would always be reaped at the TTL boundary).
+        entry.lastSeen = Date.now();
 
         const webReq = toWebRequest(req);
         // Scrypted parses the body as text — give it back as a parsed JSON object so the
@@ -648,10 +686,7 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
         await fromWebResponse(webRes, res);
     }
 
-    private async createSession(): Promise<{
-        transport: WebStandardStreamableHTTPServerTransport;
-        server: McpServer;
-    }> {
+    private async createSession(): Promise<SessionEntry> {
         const transport = new WebStandardStreamableHTTPServerTransport({
             sessionIdGenerator: () => randomUUID(),
             onsessioninitialized: sid => {
@@ -664,7 +699,7 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
             },
         });
         const server = createMcpServer();
-        const entry = { transport, server };
+        const entry: SessionEntry = { transport, server, lastSeen: Date.now() };
         transport.onclose = () => {
             // Belt-and-braces against the onsessionclosed callback: if the transport closes
             // for a reason other than a DELETE (e.g. process error), drop the session anyway.

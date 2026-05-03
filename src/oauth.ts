@@ -428,7 +428,12 @@ export class OAuthService {
         if (!auth) return undefined;
         const m = /^Bearer\s+(.+)$/i.exec(auth);
         if (!m) {
-            this.console.error('[oauth] Bearer header present but malformed:', auth.slice(0, 30));
+            // Don't log the header value: when the regex fails on something like
+            // "Bearer\nxyz..." (rare, but possible with unusual whitespace) the contents
+            // can include real token bytes. Operators only need to know it was malformed,
+            // not what was in it. Log the length so a "consistently zero-length" pattern
+            // is still visible.
+            this.console.error('[oauth] Bearer header present but malformed (length=%d)', auth.length);
             return undefined;
         }
         const token = m[1];
