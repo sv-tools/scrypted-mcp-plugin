@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { getClient } from '../scrypted.js';
+import { systemManager } from '../scrypted';
 
 export const listDevicesInput = z.object({
     interface: z
@@ -13,8 +13,7 @@ export const listDevicesInput = z.object({
 });
 
 export async function listDevices(args: z.infer<typeof listDevicesInput>) {
-    const client = await getClient();
-    const state = client.systemManager.getSystemState();
+    const state = systemManager.getSystemState();
     const out: Array<{
         id: string;
         nativeId?: string;
@@ -52,8 +51,7 @@ export const getDeviceInput = z.object({
 });
 
 export async function getDevice(args: z.infer<typeof getDeviceInput>) {
-    const client = await getClient();
-    const state = client.systemManager.getSystemState();
+    const state = systemManager.getSystemState();
     const dev = state[args.id];
     if (!dev) throw new Error(`device ${args.id} not found`);
     // Snapshot every property's `value`; skip the noisy timestamp fields the SDK attaches.
@@ -69,8 +67,7 @@ export const callDeviceMethodInput = z.object({
 });
 
 export async function callDeviceMethod(args: z.infer<typeof callDeviceMethodInput>) {
-    const client = await getClient();
-    const dev = client.systemManager.getDeviceById(args.id) as any;
+    const dev = systemManager.getDeviceById(args.id) as any;
     if (!dev) throw new Error(`device ${args.id} not found`);
     const fn = dev[args.method];
     if (typeof fn !== 'function') throw new Error(`device ${args.id} does not expose method ${args.method}`);

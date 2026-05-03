@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { getComponent } from '../scrypted.js';
+import { getComponent } from '../scrypted';
 
 // ScryptedAlert shape, mirrors server/src/db-types.ts. We surface every field so the LLM can
 // triage without a second round-trip.

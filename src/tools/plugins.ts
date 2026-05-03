@@ -1,5 +1,21 @@
 import { z } from 'zod';
-import { getClient, getComponent } from '../scrypted.js';
+import { getComponent, systemManager } from '../scrypted';
+
+// npm package name of this plugin. Used to refuse get_storage / set_storage against any
+// device owned by us — that storage holds the OAuth signing key and DCR registrations,
+// and exposing it would let any authorized caller forge tokens or hijack registered
+// clients. There's no legitimate reason for an MCP tool call to read or write the MCP
+// plugin's own storage, so the block is a hard reject rather than a redaction.
+const SELF_PLUGIN_ID = 'scrypted-mcp';
+
+function refuseIfOwnPlugin(deviceId: string): void {
+    const dev = systemManager.getDeviceById(deviceId) as { pluginId?: string } | undefined;
+    if (dev?.pluginId === SELF_PLUGIN_ID) {
+        throw new Error(
+            "refusing to read/write the scrypted-mcp plugin's own storage; it holds the OAuth signing key and client registrations",
+        );
+    }
+}
 
 interface PluginComponent {
     getPluginInfo(pluginId: string): Promise<any>;
@@ -20,8 +36,7 @@ interface PluginComponent {
 export const listPluginsInput = z.object({});
 
 export async function listPlugins() {
-    const client = await getClient();
-    const state = client.systemManager.getSystemState();
+    const state = systemManager.getSystemState();
     // A plugin's controller device has type 'API' — but a more robust signal is a populated
     // `pluginId` property equal to the device's own nativeId. We surface both ids and the
     // human-readable name so the LLM can pick the right one for follow-ups.
@@ -133,6 +148,7 @@ export const getStorageInput = z.object({
 });
 
 export async function getStorage(args: z.infer<typeof getStorageInput>) {
+    refuseIfOwnPlugin(args.id);
     const plugins = await getComponent<PluginComponent>('plugins');
     const storage = await plugins.getStorage(args.id);
     return { id: args.id, storage: storage ?? {} };
@@ -148,6 +164,7 @@ export const setStorageInput = z.object({
 });
 
 export async function setStorage(args: z.infer<typeof setStorageInput>) {
+    refuseIfOwnPlugin(args.id);
     const plugins = await getComponent<PluginComponent>('plugins');
     await plugins.setStorage(args.id, args.storage);
     return { id: args.id, storage: args.storage };

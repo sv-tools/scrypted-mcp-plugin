@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { getComponent } from '../scrypted.js';
+import { getComponent } from '../scrypted';
 
 interface UsersComponent {
     getAllUsers(): Promise<Array<{ username: string; admin: boolean }>>;
