@@ -111,7 +111,7 @@ function wrap<TArgs, TResult>(handler: (args: TArgs) => Promise<TResult>, opts: 
 // closes the connection or sends DELETE — so the per-session allocation cost is fine.
 function createMcpServer(): McpServer {
     const server = new McpServer(
-        { name: 'scrypted-mcp', version: '0.4.0' },
+        { name: 'scrypted-mcp', version: '0.4.1' },
         {
             instructions: [
                 'This MCP server runs inside a Scrypted plugin and controls the same Scrypted server (https://scrypted.app).',
