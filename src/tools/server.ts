@@ -68,8 +68,14 @@ export async function getDotEnv() {
         // ENOENT is normal — no .env file has been written yet. Surface it as empty content
         // rather than an error so the LLM can decide whether to seed one with set_dotenv.
         // Match on the message text too: error.code doesn't survive RPC serialization, so
-        // checking only `e.code` would let real ENOENTs slip through as raw errors.
-        if (e?.code === 'ENOENT' || /\bENOENT\b/.test(String(e?.message ?? e))) return { content: '' };
+        // checking only `e.code` would let real ENOENTs slip through as raw errors. We
+        // require the failing path to end with `.env` so an unrelated ENOENT (e.g. broken
+        // volume mount that surfaced through some other internal lookup) still bubbles up.
+        const msg = String(e?.message ?? e);
+        const isDotEnvMissing =
+            (e?.code === 'ENOENT' && /\.env$/.test(String(e?.path ?? ''))) ||
+            (/\bENOENT\b/.test(msg) && /'[^']*\.env'/.test(msg));
+        if (isDotEnvMissing) return { content: '' };
         throw e;
     }
 }
