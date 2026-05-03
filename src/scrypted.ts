@@ -17,7 +17,7 @@ export async function getClient(): Promise<ScryptedClientStatic> {
         // Scrypted's default is a self-signed cert. The user runs this MCP locally against
         // their own server, so we accept self-signed by default. Tighten if SCRYPTED_TLS_STRICT=1.
         if (process.env.SCRYPTED_TLS_STRICT !== '1') process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
-        cached = connectScryptedClient({
+        const myPromise: Promise<ScryptedClientStatic> = connectScryptedClient({
             baseUrl: cfg.baseUrl,
             username: cfg.username,
             password: cfg.password,
@@ -27,14 +27,21 @@ export async function getClient(): Promise<ScryptedClientStatic> {
                 // Suspenders: when the underlying engine.io socket closes, drop the cache so
                 // the next call rebuilds a fresh client. The retry layer in `wrap()` is the
                 // belt — it catches in-flight tool calls that fail before this fires.
-                client.onClose = () => invalidateClient();
+                //
+                // Scope the invalidation to *this* cached promise: if a reconnect already
+                // happened (e.g. via the wrap-retry path) and replaced `cached` with a newer
+                // client, a late onClose from this stale client must not clear the fresh one.
+                client.onClose = () => {
+                    if (cached === myPromise) cached = undefined;
+                };
                 return client;
             })
             .catch(e => {
                 // Reset so a future call retries — useful when the server was just starting.
-                cached = undefined;
+                if (cached === myPromise) cached = undefined;
                 throw e;
             });
+        cached = myPromise;
     }
     return cached;
 }
