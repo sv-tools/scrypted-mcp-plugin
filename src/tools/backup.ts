@@ -24,6 +24,28 @@ function timestampSlug() {
     return new Date().toISOString().replace(/[:.]/g, '-');
 }
 
+// Strict base64 decode. `Buffer.from(s, 'base64')` is famously lenient — it silently drops
+// whitespace, ignores non-base64 chars after the first invalid one, and accepts unpadded
+// input. For a destructive `restore_backup` call we want the inverse: refuse early if the
+// input doesn't match RFC 4648 standard base64 verbatim (with padding), so we never stage
+// silently-truncated bytes and call `backup.restore()` on them.
+function strictBase64Decode(input: string): Buffer {
+    if (!/^[A-Za-z0-9+/]*={0,2}$/.test(input)) {
+        throw new Error('backupBase64 contains characters that are not standard base64 (RFC 4648)');
+    }
+    if (input.length === 0 || input.length % 4 !== 0) {
+        throw new Error('backupBase64 length must be a positive multiple of 4 (with padding)');
+    }
+    const buf = Buffer.from(input, 'base64');
+    // Round-trip: re-encode and compare. Catches edge cases like trailing junk past padding
+    // that the regex above lets through (e.g. "AAAA====" passes the char check but won't
+    // round-trip).
+    if (buf.toString('base64') !== input) {
+        throw new Error('backupBase64 did not round-trip cleanly; the input is malformed');
+    }
+    return buf;
+}
+
 export const createBackupInput = z.object({});
 
 export async function createBackup() {
@@ -95,7 +117,7 @@ export function makeRestoreBackupHandler(server: McpServer) {
         // actual size of what they're about to install. Failing here (bad base64, ENOSPC)
         // means we never gate on the user — but it also means the destructive path was
         // never reached, which is fine.
-        const data = Buffer.from(args.backupBase64, 'base64');
+        const data = strictBase64Decode(args.backupBase64);
         if (data.length === 0) throw new Error('backupBase64 decoded to zero bytes');
 
         const tmpPath = path.join(os.tmpdir(), `scrypted-restore-${timestampSlug()}.zip`);
@@ -118,7 +140,7 @@ export function makeRestoreBackupHandler(server: McpServer) {
                 `About to restore Scrypted from staged ZIP at "${tmpPath}" (${data.length} bytes).`,
                 'This will kill the running Scrypted server, wipe the existing database and all installed plugin files,',
                 'then extract the backup and restart. Plugins will be reinstalled from npm on first boot.',
-                'Type RESTORE to proceed, or anything else to cancel.',
+                'Choose RESTORE to proceed or CANCEL to abort.',
             ].join(' '),
             requestedSchema: {
                 type: 'object',
@@ -126,7 +148,7 @@ export function makeRestoreBackupHandler(server: McpServer) {
                     confirm: {
                         type: 'string',
                         title: 'Confirm restore',
-                        description: 'Type RESTORE to proceed.',
+                        description: 'Choose RESTORE to proceed or CANCEL to abort.',
                         enum: ['RESTORE', 'CANCEL'],
                     },
                 },

@@ -143,6 +143,35 @@ function asStringArray(v: unknown): string[] | undefined {
     return Array.isArray(v) ? v.filter(s => typeof s === 'string') : undefined;
 }
 
+// Whitelist redirect_uri schemes allowed at DCR. We restrict to loopback HTTP per RFC 8252:
+// `http://localhost`, `http://127.0.0.1`, or `http://[::1]` with any path/port. This is the
+// canonical pattern for native MCP clients (Claude Code uses `http://localhost:<random>/callback`).
+//
+// The reason this is a hard rule rather than a "preferred" one: with auto-approve at /authorize
+// + open Dynamic Client Registration, any unrestricted redirect_uri turns into a drive-by-auth
+// hole. An attacker registers a client with `redirect_uri = https://attacker.example/cb`, links
+// a logged-in admin to /authorize, and the auth code lands at the attacker's URL. PKCE doesn't
+// help because the attacker generated the code_challenge during registration. Loopback URIs
+// can't easily be impersonated by a remote attacker, so they break the attack chain.
+function isAllowedRedirectUri(uri: string): boolean {
+    let url: URL;
+    try {
+        url = new URL(uri);
+    } catch {
+        return false;
+    }
+    if (url.protocol !== 'http:') return false;
+    const host = url.hostname.toLowerCase();
+    return host === 'localhost' || host === '127.0.0.1' || host === '::1';
+}
+
+// Reject scopes the AS doesn't advertise. Returning the intersection (rather than the raw
+// requested string) means the access token can't claim a scope we never agreed to honor —
+// even if no current tool checks scopes, this keeps the door closed for tomorrow.
+function intersectScopes(requested: string): string[] {
+    return requested.split(/\s+/).filter(s => s && SUPPORTED_SCOPES.includes(s));
+}
+
 // --- Stores ----------------------------------------------------------------
 
 class ClientStore {
@@ -443,6 +472,16 @@ export class OAuthService {
             });
             return;
         }
+        const badUris = redirectUris.filter(u => !isAllowedRedirectUri(u));
+        if (badUris.length > 0) {
+            sendJson(res, 400, {
+                error: 'invalid_redirect_uri',
+                error_description:
+                    'redirect_uri must be loopback HTTP (http://localhost, http://127.0.0.1, or http://[::1]); rejected: ' +
+                    badUris.join(', '),
+            });
+            return;
+        }
 
         const grantTypes = asStringArray(body.grant_types) ?? ['authorization_code'];
         if (!grantTypes.includes('authorization_code')) {
@@ -477,11 +516,24 @@ export class OAuthService {
     // --- Authorization endpoint -------------------------------------------
 
     private async handleAuthorize(req: HttpRequest, res: HttpResponse) {
-        // Routed against the authenticated path — Scrypted's auth pipeline runs first and
-        // either populates `username` or 401s us before we get here. If we got here without a
-        // username it means somebody routed us through /public, which we don't allow.
+        // Scrypted's auth pipeline populates `username` from the session cookie regardless of
+        // public/authenticated routing. Missing `username` means the user isn't signed in.
         if (!req.username) {
             sendHtml(res, 401, renderUnauthorizedPage(), { 'WWW-Authenticate': 'Cookie' });
+            return;
+        }
+        // MCP exposes admin-grade tools (restore_backup, set_dotenv, restart_server, ...).
+        // Lock the AS to Scrypted admins — `aclId` is undefined for env-admin/passwd-admin
+        // sessions and set to a device id for ACL-restricted users.
+        if (req.aclId) {
+            sendHtml(
+                res,
+                403,
+                renderErrorPage(
+                    'Admin access required',
+                    'The Scrypted MCP plugin only authorizes Scrypted admin users. Sign in as an admin and retry.',
+                ),
+            );
             return;
         }
 
@@ -493,7 +545,7 @@ export class OAuthService {
         const codeChallenge = params.get('code_challenge') ?? '';
         const codeChallengeMethod = params.get('code_challenge_method') ?? '';
         const state = params.get('state') ?? '';
-        const scope = params.get('scope') ?? SUPPORTED_SCOPES.join(' ');
+        const scopeParam = params.get('scope') ?? SUPPORTED_SCOPES.join(' ');
         const resource = params.get('resource') ?? undefined;
 
         const client = this.clients.get(clientId);
@@ -533,6 +585,15 @@ export class OAuthService {
             redirectError('invalid_request', 'PKCE with code_challenge_method=S256 is required');
             return;
         }
+        const scopes = intersectScopes(scopeParam);
+        if (scopes.length === 0) {
+            redirectError(
+                'invalid_scope',
+                `none of the requested scopes are supported (supported: ${SUPPORTED_SCOPES.join(', ')})`,
+            );
+            return;
+        }
+        const scope = scopes.join(' ');
 
         // Auto-approve — option (a) per the design discussion. The user's Scrypted session
         // is the proof that they meant to grant this. No consent screen.
