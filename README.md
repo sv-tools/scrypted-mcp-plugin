@@ -129,7 +129,7 @@ The daemon picks up credentials from `~/.scrypted-mcp/config.json` automatically
 
 ```bash
 npm run build
-claude mcp add scrypted -- node "$(pwd)/dist/index.js"
+claude mcp add scrypted --scope=user -- node "$(pwd)/dist/index.js"
 ```
 
 ## Develop
