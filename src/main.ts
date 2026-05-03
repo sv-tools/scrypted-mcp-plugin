@@ -674,7 +674,7 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
                     'and re-authenticate.',
                 ].join(' '),
                 type: 'button',
-                group: 'Actions',
+                group: 'Status',
             },
         ];
     }
