@@ -65,7 +65,7 @@ Use this same three-gate shape for any new destructive tool that mutates server 
 
 ## Backup data flow
 
-Backups travel over the wire as base64 inside MCP `EmbeddedResource` content blocks. `create_backup` writes the ZIP to `os.tmpdir()` on the Scrypted host (so the agent can chain a separate file copy if it wants), schedules a 1-hour cleanup, and returns `{ tmpPath, bytes, sha256 }` plus the inline blob. `restore_backup` takes a base64 string in, decodes to a `Buffer`, writes to tmp on the server, then hands the buffer to the `backup` component.
+Backups travel over the wire as base64 inside MCP `EmbeddedResource` content blocks; nothing touches the Scrypted host filesystem. `create_backup` returns `{ bytes, sha256 }` as a JSON summary plus the inline ZIP blob under a synthetic `scrypted:backup/<timestamp>.zip` URI — the agent saves it wherever it wants on its own box. `restore_backup` takes a base64 string in, decodes to a `Buffer` in memory, computes sha256 (surfaced in the elicitation prompt and in the no-elicitation refusal so the user can verify they're restoring the bytes they think they are), then hands the buffer directly to the `backup` component. Earlier versions staged the ZIP to `os.tmpdir()` for both flows; that was vestigial — the bytes are always in memory anyway, and tmp staging just accumulated multi-MB files across failed/cancelled restores.
 
 ## Conventions
 

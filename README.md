@@ -88,8 +88,8 @@ The login step is just **your existing Scrypted session**. When the MCP client o
 
 ### Backup & restore
 
-- `create_backup` — Snapshot the Scrypted database. Writes a staged ZIP to `os.tmpdir()` on the Scrypted host (auto-cleaned after 1 h) and returns the bytes inline as a base64-encoded `EmbeddedResource` for the agent to save locally.
-- `restore_backup` — Restore from a base64-encoded backup ZIP. **Destructive** — wipes the database and installed plugin files.
+- `create_backup` — Snapshot the Scrypted database. Returns the ZIP inline as a base64-encoded `EmbeddedResource` (plus a JSON summary with byte count + sha256) for the agent to save locally. Nothing is written to the Scrypted host filesystem.
+- `restore_backup` — Restore from a base64-encoded backup ZIP. The MCP host decodes it in memory and hands the bytes directly to Scrypted — no tmp file is staged on the host. **Destructive** — wipes the database and installed plugin files.
 
 `restore_backup` is gated three ways before it runs:
 

@@ -520,7 +520,7 @@ function createMcpServer(): McpServer {
         'create_backup',
         {
             description:
-                'Snapshot the Scrypted database. Stages a ZIP at a tmp path on the Scrypted host (auto-cleaned after 1h) and returns the bytes inline as a base64-encoded resource the agent can save locally.',
+                'Snapshot the Scrypted database. Returns the ZIP inline as a base64-encoded resource (plus a JSON summary with byte count + sha256) for the agent to save locally. Nothing is written to the Scrypted host filesystem.',
             inputSchema: createBackupInput.shape,
             annotations: {
                 title: 'Create Scrypted backup',
