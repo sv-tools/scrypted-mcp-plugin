@@ -622,6 +622,7 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
     }
 
     async getSettings(): Promise<Setting[]> {
+        const stats = this.oauth.getStats();
         return [
             {
                 key: 'dcr_max_clients',
@@ -633,18 +634,91 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
                     'Default: ' + DEFAULT_DCR_MAX_CLIENTS + '.',
                 ].join(' '),
                 type: 'integer',
+                group: 'Configuration',
                 value: this.getDcrMaxClients(),
+            },
+            {
+                key: 'active_sessions',
+                title: 'Active MCP sessions',
+                description: 'In-memory MCP sessions currently held open. Idle sessions are reaped after 1h.',
+                type: 'integer',
+                group: 'Status',
+                readonly: true,
+                value: this.sessions.size,
+            },
+            {
+                key: 'registered_clients',
+                title: 'Registered DCR clients',
+                description: 'Persisted client registrations in plugin storage.',
+                type: 'integer',
+                group: 'Status',
+                readonly: true,
+                value: stats.clients,
+            },
+            {
+                key: 'active_refresh_tokens',
+                title: 'Persisted refresh tokens',
+                description: 'Refresh tokens currently in plugin storage (each has a 30-day TTL).',
+                type: 'integer',
+                group: 'Status',
+                readonly: true,
+                value: stats.refreshTokens,
+            },
+            {
+                key: 'revoke_all',
+                title: 'Revoke all tokens & disconnect clients',
+                description: [
+                    'DESTRUCTIVE. Drops every refresh token, deletes every DCR registration,',
+                    'rotates the JWT signing key (existing access tokens stop verifying),',
+                    'and closes all active MCP sessions. Every client will need to re-register',
+                    'and re-authenticate.',
+                ].join(' '),
+                type: 'button',
+                group: 'Actions',
             },
         ];
     }
 
     async putSetting(key: string, value: SettingValue): Promise<void> {
-        if (key !== 'dcr_max_clients') throw new Error(`unknown setting: ${key}`);
-        const n = Number(value);
-        if (!Number.isFinite(n) || n <= 0) throw new Error('dcr_max_clients must be a positive number');
-        this.storage.setItem(STORAGE_KEY_DCR_MAX_CLIENTS, String(Math.floor(n)));
+        if (key === 'dcr_max_clients') {
+            const n = Number(value);
+            if (!Number.isFinite(n) || n <= 0) throw new Error('dcr_max_clients must be a positive number');
+            this.storage.setItem(STORAGE_KEY_DCR_MAX_CLIENTS, String(Math.floor(n)));
+        } else if (key === 'revoke_all') {
+            const counts = await this.oauth.revokeAll();
+            const closed = this.closeAllSessions();
+            this.console.log(
+                '[scrypted-mcp] revoke_all: dropped %d clients + %d refresh tokens, closed %d sessions, rotated signing key',
+                counts.clients,
+                counts.refreshTokens,
+                closed,
+            );
+        } else if (key === 'active_sessions' || key === 'registered_clients' || key === 'active_refresh_tokens') {
+            // Read-only stats — no-op; the UI may round-trip the value on save.
+            return;
+        } else {
+            throw new Error(`unknown setting: ${key}`);
+        }
         // Tell Scrypted the device's settings changed so the UI re-fetches via getSettings().
+        // For revoke_all this also surfaces the freshly-zeroed stats.
         await this.onDeviceEvent(ScryptedInterface.Settings, undefined);
+    }
+
+    // Tear down every live MCP session. Used by the revoke_all button. The transports'
+    // onclose handlers also remove from the map; we delete inline as a backstop and to
+    // give an accurate count back to the caller.
+    private closeAllSessions(): number {
+        let closed = 0;
+        for (const [sid, entry] of this.sessions) {
+            try {
+                entry.transport.close();
+            } catch {
+                // closing an already-closed transport is fine
+            }
+            this.sessions.delete(sid);
+            closed++;
+        }
+        return closed;
     }
 
     private sweepIdleSessions(): void {

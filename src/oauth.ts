@@ -429,6 +429,7 @@ export interface OAuthServiceOptions {
 const REFRESH_TOKEN_SWEEP_INTERVAL_MS = 30 * 60 * 1000;
 
 export class OAuthService {
+    private storage: StorageLike;
     private clients: ClientStore;
     private codes = new AuthCodeStore();
     private refreshTokens: RefreshTokenStore;
@@ -437,6 +438,7 @@ export class OAuthService {
 
     constructor(opts: OAuthServiceOptions) {
         this.console = opts.console;
+        this.storage = opts.storage;
         this.clients = new ClientStore(opts.storage, opts.getMaxClients, opts.console);
         this.refreshTokens = new RefreshTokenStore(opts.storage, opts.console);
         this.signing = loadOrCreateSigningKey(opts.storage);
@@ -447,6 +449,71 @@ export class OAuthService {
             const dropped = this.refreshTokens.sweepExpired();
             if (dropped > 0) this.console.log('[oauth] swept %d expired refresh token(s)', dropped);
         }, REFRESH_TOKEN_SWEEP_INTERVAL_MS).unref();
+    }
+
+    // Counts persisted OAuth records by prefix. Used by the Settings UI to show a
+    // health snapshot without exposing the records themselves.
+    getStats(): { clients: number; refreshTokens: number } {
+        let clients = 0;
+        let refreshTokens = 0;
+        try {
+            for (let i = 0; i < this.storage.length; i++) {
+                const k = this.storage.key(i);
+                if (!k) continue;
+                if (k.startsWith(STORAGE_KEY_CLIENT_PREFIX)) clients++;
+                else if (k.startsWith(STORAGE_KEY_REFRESH_TOKEN_PREFIX)) refreshTokens++;
+            }
+        } catch (e) {
+            this.console.error('[oauth] getStats iteration failed:', e);
+        }
+        return { clients, refreshTokens };
+    }
+
+    // Hard revoke, surfaced via the plugin's "Revoke all tokens" Settings button. Drops
+    // every persisted refresh token, deletes every DCR client registration, rotates the
+    // JWT signing key (so previously-issued access tokens immediately stop verifying), and
+    // resets the in-memory auth-code store. Caller is responsible for closing live MCP
+    // sessions — this method only handles state owned by OAuthService.
+    //
+    // After this, any active client will see 401s on its next request and have to re-run
+    // DCR + PKCE from scratch.
+    async revokeAll(): Promise<{ clients: number; refreshTokens: number }> {
+        const counts = { clients: 0, refreshTokens: 0 };
+        const keysToRemove: string[] = [];
+        try {
+            for (let i = 0; i < this.storage.length; i++) {
+                const k = this.storage.key(i);
+                if (!k) continue;
+                if (k.startsWith(STORAGE_KEY_CLIENT_PREFIX)) {
+                    keysToRemove.push(k);
+                    counts.clients++;
+                } else if (k.startsWith(STORAGE_KEY_REFRESH_TOKEN_PREFIX)) {
+                    keysToRemove.push(k);
+                    counts.refreshTokens++;
+                }
+            }
+        } catch (e) {
+            this.console.error('[oauth] revokeAll iteration failed:', e);
+            throw e;
+        }
+        for (const k of keysToRemove) this.storage.removeItem(k);
+        // Rotate the signing key. Removing the persisted JWK and re-running
+        // loadOrCreateSigningKey forces generation of a fresh EC P-256 pair, which means
+        // every still-unexpired access token (1h TTL) suddenly fails JWS verification.
+        // Without this, an AT issued one second before the revoke would keep working for
+        // ~59 minutes. Awaited so we surface key-generation errors here rather than at the
+        // next inbound request.
+        this.storage.removeItem(STORAGE_KEY_SIGNING_JWK);
+        this.signing = loadOrCreateSigningKey(this.storage);
+        await this.signing;
+        // In-memory auth codes are short-lived (60s) but a thorough revoke includes them.
+        this.codes = new AuthCodeStore();
+        this.console.log(
+            '[oauth] revokeAll: removed %d clients + %d refresh tokens, rotated signing key',
+            counts.clients,
+            counts.refreshTokens,
+        );
+        return counts;
     }
 
     // Compute paths for this request's perspective (origin + plugin root). Centralised
