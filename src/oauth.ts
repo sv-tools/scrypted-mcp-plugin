@@ -724,12 +724,18 @@ export class OAuthService {
         const codeVerifier = asString(body.code_verifier);
         const clientId = asString(body.client_id);
         const redirectUri = asString(body.redirect_uri);
-        if (!code || !codeVerifier || !clientId) {
+        // OAuth 2.1 / RFC 6749 §4.1.3: when redirect_uri was sent at /authorize (which we
+        // require — see handleAuthorize), it MUST be sent at /token and match exactly. The
+        // earlier "only check if present" pass would let a token request through with a
+        // missing redirect_uri, weakening the binding between the auth code and the
+        // redirect target it was issued for.
+        if (!code || !codeVerifier || !clientId || !redirectUri) {
             this.console.error(
-                '[oauth] /token reject: invalid_request — has code=%s code_verifier=%s client_id=%s',
+                '[oauth] /token reject: invalid_request — has code=%s code_verifier=%s client_id=%s redirect_uri=%s',
                 !!code,
                 !!codeVerifier,
                 !!clientId,
+                !!redirectUri,
             );
             sendJson(res, 400, { error: 'invalid_request' });
             return;
@@ -757,7 +763,7 @@ export class OAuthService {
             sendJson(res, 400, { error: 'invalid_grant', error_description: 'client_id does not match code' });
             return;
         }
-        if (redirectUri && redirectUri !== pending.redirectUri) {
+        if (redirectUri !== pending.redirectUri) {
             this.console.error(
                 '[oauth] /token reject: invalid_grant — redirect_uri mismatch (expected=%s got=%s)',
                 pending.redirectUri,

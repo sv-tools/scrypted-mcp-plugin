@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { getComponent } from '../scrypted';
+import { getComponent, isExpectedDisconnectError } from '../scrypted';
 
 interface InfoComponent {
     getVersion(): Promise<string>;
@@ -33,12 +33,14 @@ export const restartServerInput = z.object({});
 
 export async function restartServer() {
     // restart() calls process.exit() server-side; the RPC peer dies before the call resolves.
-    // We swallow that disconnect so the tool reports success rather than a transport error.
+    // We swallow *that* disconnect so the tool reports success rather than a transport
+    // error — but unrelated failures (permission denied, service-control unavailable, etc.)
+    // must propagate so the caller doesn't get a misleading "restarting: true".
     const svc = await getComponent<ServiceControlComponent>('service-control');
     try {
         await svc.restart();
-    } catch {
-        // Connection drops are expected — that's the restart happening.
+    } catch (e) {
+        if (!isExpectedDisconnectError(e)) throw e;
     }
     return { restarting: true };
 }
@@ -47,12 +49,12 @@ export const updateServerInput = z.object({});
 
 export async function updateServer() {
     // Triggers SCRYPTED_WEBHOOK_UPDATE if set, otherwise writes `.update` and restarts.
-    // Same disconnect handling as restartServer.
+    // Same disconnect handling as restartServer: only the post-update kill is expected.
     const svc = await getComponent<ServiceControlComponent>('service-control');
     try {
         await svc.update();
-    } catch {
-        // Same: server-initiated restart kills the RPC connection.
+    } catch (e) {
+        if (!isExpectedDisconnectError(e)) throw e;
     }
     return { updating: true };
 }

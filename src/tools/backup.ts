@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { getComponent } from '../scrypted';
+import { getComponent, isExpectedDisconnectError } from '../scrypted';
 
 interface BackupComponent {
     createBackup(): Promise<Buffer>;
@@ -169,11 +169,14 @@ export function makeRestoreBackupHandler(server: McpServer) {
         const backup = await getComponent<BackupComponent>('backup');
         try {
             await backup.restore(data);
-        } catch {
+        } catch (e) {
             // Server-side restore() calls runtime.kill() then schedules a restart, so the
-            // RPC connection drops before the call resolves. Treat that as success — and
-            // leave the tmp file in place; the host is restarting and the cleanup wouldn't
-            // run anyway.
+            // RPC connection drops before the call resolves. Treat *that* disconnect as
+            // success — but real failures (corrupt ZIP rejected by the restore validator,
+            // permission errors, ENOSPC, etc.) must propagate so we don't silently report
+            // a successful restore that never happened. Leave the tmp file in place either
+            // way so an operator can recover.
+            if (!isExpectedDisconnectError(e)) throw e;
         }
         return { restored: true, bytes: data.length, tmpPath };
     };

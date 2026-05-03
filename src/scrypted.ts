@@ -18,3 +18,25 @@ export const endpointManager = sdk.endpointManager;
 export async function getComponent<T = any>(name: string): Promise<T> {
     return sdk.systemManager.getComponent(name) as Promise<T>;
 }
+
+// Some component RPCs (backup.restore, service-control.restart/update) intentionally drop
+// the RPC channel before resolving — they call process.exit / runtime.kill server-side.
+// Tools that invoke those want to report success when the connection drops as expected, but
+// must NOT swallow real validation/permission errors. This heuristic matches on the error
+// shapes Node/Scrypted produce for a torn-down RPC peer or socket; anything else falls
+// through and propagates.
+export function isExpectedDisconnectError(e: unknown): boolean {
+    if (!e) return false;
+    const err = e as { code?: string; message?: string };
+    if (err.code === 'ECONNRESET' || err.code === 'EPIPE' || err.code === 'ECONNABORTED') return true;
+    const msg = String(err.message ?? '');
+    return (
+        /socket hang up/i.test(msg) ||
+        /connection (closed|reset|aborted|terminated)/i.test(msg) ||
+        /rpc.*?(closed|killed|disconnect|ended)/i.test(msg) ||
+        /peer.*?(closed|killed|ended|disconnect)/i.test(msg) ||
+        /not connected/i.test(msg) ||
+        /channel closed/i.test(msg) ||
+        /connection ended/i.test(msg)
+    );
+}
