@@ -80,11 +80,17 @@ function base64urlNoPad(buf: Buffer): string {
 
 // Build the public origin (e.g. "https://scrypt.local:10443") that the inbound request used,
 // so OAuth metadata documents come back with URLs the client can actually hit. Scrypted's
-// HttpRequest doesn't carry the protocol directly, so we infer it:
-//   1. If the request came through a reverse proxy that set `x-forwarded-proto`, trust it.
-//   2. Otherwise compare the host header's port to SCRYPTED_INSECURE_PORT (default 11080).
-//      A match means HTTP; anything else (including the secure default 10443, or an absent
-//      port like a behind-a-LB hostname) means HTTPS.
+// HttpRequest doesn't carry the protocol directly, so we resolve it independently per axis:
+//   - host: prefer `x-forwarded-host`, else the regular `Host` header.
+//   - proto: prefer `x-forwarded-proto`, else compare the chosen host's port to
+//     SCRYPTED_INSECURE_PORT (default 11080). A match means HTTP; anything else (including
+//     the secure default 10443, or an absent port like a behind-a-LB hostname) means HTTPS.
+//
+// Treating the two headers independently matters because plenty of reverse proxies (nginx
+// with the canned `proxy_set_header X-Forwarded-Proto` snippet, Cloudflare, ALB-without-host)
+// set proto but leave Host alone. If we required both, those deployments would fall through
+// to the port heuristic on the *forwarded* request — which the proxy already rewrote — and
+// pick the wrong scheme.
 //
 // Getting this wrong is fatal: if we advertise https URLs while the client is talking to us
 // over http (or vice versa), every metadata fetch fails, the MCP TS SDK falls all the way
@@ -93,9 +99,10 @@ function originFromRequest(req: HttpRequest): string {
     const headers = req.headers ?? {};
     const xfProto = headers['x-forwarded-proto']?.split(',')[0].trim();
     const xfHost = headers['x-forwarded-host']?.split(',')[0].trim();
-    if (xfProto && xfHost) return `${xfProto}://${xfHost}`;
 
-    const host = headers['host'] || 'localhost';
+    const host = xfHost || headers['host'] || 'localhost';
+    if (xfProto) return `${xfProto}://${host}`;
+
     const insecurePort = Number.parseInt(process.env.SCRYPTED_INSECURE_PORT ?? '11080', 10);
     const portMatch = /:(\d+)$/.exec(host);
     const port = portMatch ? Number.parseInt(portMatch[1], 10) : null;
