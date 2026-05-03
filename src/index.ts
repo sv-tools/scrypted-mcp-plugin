@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { invalidateClient, isTransientConnectionError } from './scrypted.js';
 import { runSetup } from './setup.js';
 import {
     clearAlerts,
@@ -87,7 +88,7 @@ if (process.argv[2] === 'setup') {
 }
 
 const server = new McpServer(
-    { name: 'scrypted-mcp', version: '0.2.1' },
+    { name: 'scrypted-mcp', version: '0.3.0' },
     {
         instructions: [
             'This MCP server controls a running Scrypted server (https://scrypted.app).',
@@ -104,11 +105,20 @@ const server = new McpServer(
 );
 
 // Wrap each tool handler so any thrown error becomes a structured MCP error response
-// instead of crashing the stdio server.
+// instead of crashing the stdio server. Also retries once on a transport error: long-running
+// MCP sessions periodically lose the engine.io connection to Scrypted, and a single auto-retry
+// with a fresh client smooths over the drop without bothering the user.
 function wrap<TArgs, TResult>(handler: (args: TArgs) => Promise<TResult>) {
     return async (args: TArgs) => {
         try {
-            const result = await handler(args);
+            let result: TResult;
+            try {
+                result = await handler(args);
+            } catch (e: any) {
+                if (!isTransientConnectionError(e)) throw e;
+                invalidateClient();
+                result = await handler(args);
+            }
             return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] };
         } catch (e: any) {
             return {

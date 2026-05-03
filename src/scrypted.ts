@@ -5,6 +5,12 @@ import { loadConfig } from './config.js';
 // (Claude Desktop / Claude Code), so we only ever need a single Scrypted session per process.
 let cached: Promise<ScryptedClientStatic> | undefined;
 
+// Drop the cached client so the next getClient() call reconnects. Called from `wrap()` when a
+// tool throws a transport error, and from `client.onClose` when the underlying socket closes.
+export function invalidateClient() {
+    cached = undefined;
+}
+
 export async function getClient(): Promise<ScryptedClientStatic> {
     if (!cached) {
         const cfg = loadConfig();
@@ -16,11 +22,19 @@ export async function getClient(): Promise<ScryptedClientStatic> {
             username: cfg.username,
             password: cfg.password,
             pluginId: '@scrypted/core',
-        }).catch(e => {
-            // Reset so a future call retries — useful when the server was just starting.
-            cached = undefined;
-            throw e;
-        });
+        })
+            .then(client => {
+                // Suspenders: when the underlying engine.io socket closes, drop the cache so
+                // the next call rebuilds a fresh client. The retry layer in `wrap()` is the
+                // belt — it catches in-flight tool calls that fail before this fires.
+                client.onClose = () => invalidateClient();
+                return client;
+            })
+            .catch(e => {
+                // Reset so a future call retries — useful when the server was just starting.
+                cached = undefined;
+                throw e;
+            });
     }
     return cached;
 }
@@ -31,4 +45,14 @@ export async function getClient(): Promise<ScryptedClientStatic> {
 export async function getComponent<T = any>(name: string): Promise<T> {
     const client = await getClient();
     return client.systemManager.getComponent(name) as Promise<T>;
+}
+
+// Heuristic: does this error look like a dropped/refused/timed-out connection as opposed to
+// a real server-side error? Used by `wrap()` to decide whether to invalidate and retry once.
+// Match list is intentionally narrow so a genuine plugin error doesn't get retried twice.
+export function isTransientConnectionError(e: any): boolean {
+    const msg = String(e?.message ?? e).toLowerCase();
+    return /engine\.io|websocket|disconnected|connection (?:closed|reset|refused)|socket hang up|econnrefused|econnreset|etimedout|epipe|eai_again/.test(
+        msg,
+    );
 }
