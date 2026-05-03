@@ -1,9 +1,17 @@
 {
     "name": "scrypted-mcp",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "description": "Scrypted plugin that exposes a Streamable HTTP Model Context Protocol endpoint, with OAuth backed by Scrypted user accounts. Lets AI assistants inspect logs, manage plugins, and query devices on the same Scrypted server.",
     "license": "MIT",
     "author": "Sergey Vilgelm <sergey@vilgelm.com>",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/sv-tools/scrypted-mcp-plugin.git"
+    },
+    "bugs": {
+        "url": "https://github.com/sv-tools/scrypted-mcp-plugin/issues"
+    },
+    "homepage": "https://github.com/sv-tools/scrypted-mcp-plugin#readme",
     "scripts": {
         "scrypted-setup-project": "scrypted-setup-project",
         "prescrypted-setup-project": "scrypted-package-json",
