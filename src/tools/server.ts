@@ -67,7 +67,9 @@ export async function getDotEnv() {
     } catch (e: any) {
         // ENOENT is normal — no .env file has been written yet. Surface it as empty content
         // rather than an error so the LLM can decide whether to seed one with set_dotenv.
-        if (e?.code === 'ENOENT') return { content: '' };
+        // Match on the message text too: error.code doesn't survive RPC serialization, so
+        // checking only `e.code` would let real ENOENTs slip through as raw errors.
+        if (e?.code === 'ENOENT' || /\bENOENT\b/.test(String(e?.message ?? e))) return { content: '' };
         throw e;
     }
 }
