@@ -132,7 +132,7 @@ function wrap<TArgs, TResult>(handler: (args: TArgs) => Promise<TResult>, opts: 
 // instance directly.
 function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
     const server = new McpServer(
-        { name: 'scrypted-mcp', version: '0.4.1' },
+        { name: 'scrypted-mcp', version: '1.0.0' },
         {
             instructions: [
                 'This MCP server runs inside a Scrypted plugin and controls the same Scrypted server (https://scrypted.app).',
@@ -698,29 +698,47 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
     // Read-only display: build the URL clients should connect to. Wraps the SDK's
     // getLocalEndpoint in a try/catch so a misconfigured local discovery doesn't strand the
     // Settings panel — the field just shows a placeholder if it's not available.
-    private async getMcpEndpointUrl(): Promise<string> {
+    //
+    // Returns both schemes because Scrypted typically listens on both an HTTP and HTTPS port,
+    // and the right URL depends on the client: production deployments behind a reverse proxy
+    // want HTTPS; local-network clients (and many MCP debugging tools) work better over HTTP.
+    private async getMcpEndpointUrl(insecure: boolean): Promise<string> {
         try {
-            const base = await sdk.endpointManager.getLocalEndpoint(this.nativeId, { public: true });
+            const base = await sdk.endpointManager.getLocalEndpoint(this.nativeId, { public: true, insecure });
             // getLocalEndpoint returns the public/ root; append our /mcp path.
             return base.endsWith('/') ? `${base}mcp` : `${base}/mcp`;
         } catch (e) {
-            this.console.error('[scrypted-mcp] getMcpEndpointUrl failed:', e);
+            this.console.error('[scrypted-mcp] getMcpEndpointUrl(insecure=%s) failed:', insecure, e);
             return '(unavailable — see plugin logs)';
         }
     }
 
     async getSettings(): Promise<Setting[]> {
         const stats = this.oauth.getStats();
-        const endpoint = await this.getMcpEndpointUrl();
+        const [endpointHttps, endpointHttp] = await Promise.all([
+            this.getMcpEndpointUrl(false),
+            this.getMcpEndpointUrl(true),
+        ]);
         return [
             {
-                key: 'mcp_endpoint',
-                title: 'MCP endpoint URL',
-                description: 'The URL to configure in your MCP client (Claude Desktop, Claude Code, etc.).',
+                key: 'mcp_endpoint_https',
+                title: 'MCP endpoint URL (HTTPS)',
+                description:
+                    'The HTTPS URL to configure in your MCP client. Use this for production / remote clients. Self-signed certificate by default — paired with a reverse proxy in most deployments.',
                 type: 'string',
                 group: 'Endpoint',
                 readonly: true,
-                value: endpoint,
+                value: endpointHttps,
+            },
+            {
+                key: 'mcp_endpoint_http',
+                title: 'MCP endpoint URL (HTTP)',
+                description:
+                    'The plain-HTTP URL. Useful for local-network clients and debugging where the self-signed HTTPS cert is awkward. Do not expose to the internet.',
+                type: 'string',
+                group: 'Endpoint',
+                readonly: true,
+                value: endpointHttp,
             },
             {
                 key: 'dcr_max_clients',
@@ -848,7 +866,8 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
                 closed,
             );
         } else if (
-            key === 'mcp_endpoint' ||
+            key === 'mcp_endpoint_https' ||
+            key === 'mcp_endpoint_http' ||
             key === 'active_sessions' ||
             key === 'registered_clients' ||
             key === 'active_refresh_tokens'
