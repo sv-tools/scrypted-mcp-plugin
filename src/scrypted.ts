@@ -22,9 +22,15 @@ export async function getComponent<T = any>(name: string): Promise<T> {
 // Some component RPCs (backup.restore, service-control.restart/update) intentionally drop
 // the RPC channel before resolving — they call process.exit / runtime.kill server-side.
 // Tools that invoke those want to report success when the connection drops as expected, but
-// must NOT swallow real validation/permission errors. This heuristic matches on the error
-// shapes Node/Scrypted produce for a torn-down RPC peer or socket; anything else falls
-// through and propagates.
+// must NOT swallow real validation/permission errors.
+//
+// We deliberately match only on transport/RPC-closure signatures: Node socket error codes,
+// the canonical "socket hang up" / "connection {closed,reset,aborted,terminated}" / "channel
+// closed" phrases, and the RPC-specific "rpc/peer {closed,killed,disconnect,ended}" patterns.
+// Earlier passes also matched bare "not connected" / "connection ended", but those overlap
+// with domain errors (e.g. a downstream component reporting "device not connected") and
+// could mask real failures as success. If a new disconnect shape shows up in practice, add
+// it here explicitly rather than broadening the patterns.
 export function isExpectedDisconnectError(e: unknown): boolean {
     if (!e) return false;
     const err = e as { code?: string; message?: string };
@@ -35,8 +41,6 @@ export function isExpectedDisconnectError(e: unknown): boolean {
         /connection (closed|reset|aborted|terminated)/i.test(msg) ||
         /rpc.*?(closed|killed|disconnect|ended)/i.test(msg) ||
         /peer.*?(closed|killed|ended|disconnect)/i.test(msg) ||
-        /not connected/i.test(msg) ||
-        /channel closed/i.test(msg) ||
-        /connection ended/i.test(msg)
+        /channel closed/i.test(msg)
     );
 }
