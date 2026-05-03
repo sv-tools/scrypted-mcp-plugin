@@ -87,7 +87,7 @@ if (process.argv[2] === 'setup') {
 }
 
 const server = new McpServer(
-    { name: 'scrypted-mcp', version: '0.2.0' },
+    { name: 'scrypted-mcp', version: '0.2.1' },
     {
         instructions: [
             'This MCP server controls a running Scrypted server (https://scrypted.app).',
