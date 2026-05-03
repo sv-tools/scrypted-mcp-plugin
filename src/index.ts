@@ -108,14 +108,22 @@ const server = new McpServer(
 // instead of crashing the stdio server. Also retries once on a transport error: long-running
 // MCP sessions periodically lose the engine.io connection to Scrypted, and a single auto-retry
 // with a fresh client smooths over the drop without bothering the user.
-function wrap<TArgs, TResult>(handler: (args: TArgs) => Promise<TResult>) {
+//
+// `retry: false` opts out of the retry path. Use it for tools where re-running the handler
+// could cause a double action — most importantly `call_device_method`, where the agent picks
+// the method name and we have no way to know if it's idempotent (turnOn is, triggerSiren
+// isn't). Other destructive server-lifecycle tools (restart_server / update_server /
+// restore_backup) intentionally swallow the disconnect on success and so never enter the
+// retry path; the rest of the surface is either read-only or idempotent at the data layer.
+function wrap<TArgs, TResult>(handler: (args: TArgs) => Promise<TResult>, opts: { retry?: boolean } = {}) {
+    const retry = opts.retry ?? true;
     return async (args: TArgs) => {
         try {
             let result: TResult;
             try {
                 result = await handler(args);
             } catch (e: any) {
-                if (!isTransientConnectionError(e)) throw e;
+                if (!retry || !isTransientConnectionError(e)) throw e;
                 invalidateClient();
                 result = await handler(args);
             }
@@ -377,7 +385,10 @@ server.registerTool(
             'Invoke a method on a device (e.g. turnOn, setBrightness, getSettings). Returns the JSON-serialized result.',
         inputSchema: callDeviceMethodInput.shape,
     },
-    wrap(callDeviceMethod),
+    // Opt out of the auto-retry: the agent picks the method name, and we can't know if it's
+    // idempotent. Re-running on a socket drop after the call already reached Scrypted could
+    // double-trigger an action (triggerSiren, sendCommand, etc.).
+    wrap(callDeviceMethod, { retry: false }),
 );
 
 server.registerTool(
