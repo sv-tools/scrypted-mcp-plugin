@@ -31,5 +31,5 @@ jobs:
       - name: ESLint
         run: npm run lint
 
-      - name: Build (tsc)
+      - name: Build (scrypted-webpack)
         run: npm run build

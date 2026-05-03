@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { getClient, getComponent } from '../scrypted.js';
+import { getComponent, systemManager } from '../scrypted';
 
 interface PluginComponent {
     getPluginInfo(pluginId: string): Promise<any>;
@@ -20,8 +20,7 @@ interface PluginComponent {
 export const listPluginsInput = z.object({});
 
 export async function listPlugins() {
-    const client = await getClient();
-    const state = client.systemManager.getSystemState();
+    const state = systemManager.getSystemState();
     // A plugin's controller device has type 'API' — but a more robust signal is a populated
     // `pluginId` property equal to the device's own nativeId. We surface both ids and the
     // human-readable name so the LLM can pick the right one for follow-ups.

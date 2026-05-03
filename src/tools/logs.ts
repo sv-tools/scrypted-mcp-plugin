@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { getComponent } from '../scrypted.js';
+import { getComponent } from '../scrypted';
 
 // The Logger component returns the entire in-memory log buffer (Scrypted purges entries
 // older than 48h). Each entry has timestamp, level, title (component path), and message.

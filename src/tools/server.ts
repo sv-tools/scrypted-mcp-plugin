@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { getComponent } from '../scrypted.js';
+import { getComponent } from '../scrypted';
 
 interface InfoComponent {
     getVersion(): Promise<string>;
