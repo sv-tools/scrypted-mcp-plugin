@@ -122,10 +122,9 @@ export function makeRestoreBackupHandler(server: McpServer, getMaxBytes: () => n
                 `confirm must equal "${RESTORE_TRIPWIRE}" verbatim. The agent must surface this confirmation to the user before calling restore_backup.`,
             );
 
-        // Decode in memory and hold the buffer for the rest of the handler. We deliberately
-        // do NOT stage a tmp file on the Scrypted host — the bytes already came from the
-        // client, so re-uploading on a retry is cheap, and this avoids accumulating large
-        // ZIPs in os.tmpdir() across failed/cancelled restore attempts.
+        // Decode in memory; never staged to disk. The bytes came from the client to begin
+        // with, so a re-upload on retry is cheap, and skipping tmp avoids accumulating
+        // multi-MB ZIPs across failed or cancelled restore attempts.
         const maxBytes = Math.max(MIN_MAX_RESTORE_BYTES, Math.floor(getMaxBytes()) || DEFAULT_MAX_RESTORE_BYTES);
         const data = strictBase64Decode(args.backupBase64, maxBytes);
         if (data.length === 0) throw new Error('backupBase64 decoded to zero bytes');

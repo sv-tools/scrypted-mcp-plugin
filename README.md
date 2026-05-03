@@ -99,6 +99,37 @@ The login step is just **your existing Scrypted session**. When the MCP client o
 
 The MCP connection drops when the server restarts at the end of a successful restore.
 
+## Settings
+
+The plugin's Settings tab in the Scrypted UI surfaces both configurable knobs and a live health snapshot. Open **Plugins → MCP Server → Settings** to see them.
+
+### Endpoint
+
+Two read-only URLs the plugin computes from the live Scrypted listening address — paste whichever one matches how you're reaching Scrypted.
+
+- **MCP endpoint URL (HTTPS)** — for production clients and anything behind a reverse proxy.
+- **MCP endpoint URL (HTTP)** — for local-network clients and debugging where the self-signed HTTPS cert is awkward. Don't expose to the internet.
+
+### Configuration
+
+| Setting | Default | Range | What it does |
+| --- | --- | --- | --- |
+| `dcr_max_clients` | 100 | ≥ 1 | Cap on persisted DCR client registrations. When a `/register` would push the total above this, the least-recently-used registration is evicted. |
+| `access_token_ttl_sec` | 3600 (1 h) | 60 – 86400 | Lifetime of issued JWT access tokens. Shorter = tighter security; longer = less re-auth churn. |
+| `refresh_token_ttl_sec` | 2592000 (30 d) | 3600 – 31536000 | Lifetime of issued refresh tokens. Each refresh rotates the token (single-use), so this is the upper bound on how long a stolen RT remains valid. |
+| `max_restore_mb` | 500 | 1 – 10240 | Maximum decoded backup size that `restore_backup` will accept. Bump if your Scrypted database exceeds the default. |
+
+All four values are read at request time, so changes take effect on the next inbound request — no plugin reload required.
+
+### Status
+
+Read-only health fields, refreshed each time the Settings tab is opened.
+
+- **Active MCP sessions** — In-memory sessions currently held open. Idle sessions are reaped after 1 h.
+- **Registered DCR clients** — Persisted client registrations in plugin storage.
+- **Persisted refresh tokens** — Refresh tokens currently in plugin storage.
+- **Revoke all tokens & disconnect clients** — DESTRUCTIVE button. Drops every refresh token, deletes every DCR registration, rotates the JWT signing key (existing access tokens immediately stop verifying), and closes all active MCP sessions. Every client will need to re-register and re-authenticate. Use it if you suspect a token leak or want to force a clean slate.
+
 ## Install
 
 Search for `scrypted-mcp` in your Scrypted plugin browser, or install via the npm registry:
