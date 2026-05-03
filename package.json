@@ -1,6 +1,6 @@
 {
   "name": "scrypted-mcp",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Model Context Protocol server for Scrypted — lets AI assistants inspect logs, manage plugins, and query devices on a running Scrypted server.",
   "license": "MIT",
   "author": "Sergey Vilgelm <sergey@vilgelm.com>",
