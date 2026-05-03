@@ -122,6 +122,14 @@ export function makeRestoreBackupHandler(server: McpServer) {
 
         const tmpPath = path.join(os.tmpdir(), `scrypted-restore-${timestampSlug()}.zip`);
         await fs.writeFile(tmpPath, data);
+        // Best-effort TTL cleanup, mirroring create_backup. The cancel/reject paths below
+        // already rm the file synchronously; this timer is a backstop for the branches that
+        // intentionally leave the file behind (no-elicitation refuse, post-restore disconnect,
+        // real restore failure that propagated). If the host restarts before the timer fires,
+        // /tmp typically gets wiped anyway — this just covers the cases where it doesn't.
+        setTimeout(() => {
+            fs.rm(tmpPath, { force: true }).catch(() => {});
+        }, TMP_RETENTION_MS).unref();
 
         // Elicitation is the real lock: the server pauses and asks the client to put a
         // confirmation in front of the user. If the client doesn't advertise the elicitation
