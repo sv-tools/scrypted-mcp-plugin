@@ -1,7 +1,16 @@
 import { randomUUID } from 'node:crypto';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
-import { ScryptedDeviceBase, type HttpRequest, type HttpRequestHandler, type HttpResponse } from '@scrypted/sdk';
+import {
+    ScryptedDeviceBase,
+    ScryptedInterface,
+    type HttpRequest,
+    type HttpRequestHandler,
+    type HttpResponse,
+    type Setting,
+    type SettingValue,
+    type Settings,
+} from '@scrypted/sdk';
 import { fromWebResponse, sendJson, sendText, toWebRequest } from './http-bridge';
 import { OAuthService } from './oauth';
 import {
@@ -576,24 +585,66 @@ function createMcpServer(): McpServer {
 const SESSION_IDLE_TTL_MS = 60 * 60 * 1000; // 1h
 const SESSION_SWEEP_INTERVAL_MS = 10 * 60 * 1000; // 10min
 
+// Plugin settings. Persisted in plugin storage (so they survive reloads) under the keys
+// declared here; surfaced via getSettings() / putSetting() in the Scrypted UI.
+const STORAGE_KEY_DCR_MAX_CLIENTS = 'settings.dcr_max_clients';
+const DEFAULT_DCR_MAX_CLIENTS = 100;
+
 interface SessionEntry {
     transport: WebStandardStreamableHTTPServerTransport;
     server: McpServer;
     lastSeen: number;
 }
 
-class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler {
+class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler, Settings {
     private oauth: OAuthService;
     private sessions = new Map<string, SessionEntry>();
 
     constructor(nativeId?: string) {
         super(nativeId);
-        this.oauth = new OAuthService({ storage: this.storage, console: this.console });
+        this.oauth = new OAuthService({
+            storage: this.storage,
+            console: this.console,
+            getMaxClients: () => this.getDcrMaxClients(),
+        });
         this.console.log('[scrypted-mcp] ready. MCP endpoint: <scrypted-host>/endpoint/<package-name>/public/mcp');
         this.console.log(
             '[scrypted-mcp] OAuth metadata at the same /public/.well-known/oauth-protected-resource path.',
         );
         setInterval(() => this.sweepIdleSessions(), SESSION_SWEEP_INTERVAL_MS).unref();
+    }
+
+    private getDcrMaxClients(): number {
+        const raw = this.storage.getItem(STORAGE_KEY_DCR_MAX_CLIENTS);
+        if (!raw) return DEFAULT_DCR_MAX_CLIENTS;
+        const n = Number.parseInt(raw, 10);
+        return Number.isFinite(n) && n > 0 ? n : DEFAULT_DCR_MAX_CLIENTS;
+    }
+
+    async getSettings(): Promise<Setting[]> {
+        return [
+            {
+                key: 'dcr_max_clients',
+                title: 'Maximum DCR client registrations',
+                description: [
+                    'Cap on persisted Dynamic Client Registration entries.',
+                    'When a /register request would push the total above this number,',
+                    'the least-recently-used registration is evicted.',
+                    'Default: ' + DEFAULT_DCR_MAX_CLIENTS + '.',
+                ].join(' '),
+                type: 'integer',
+                value: this.getDcrMaxClients(),
+            },
+        ];
+    }
+
+    async putSetting(key: string, value: SettingValue): Promise<void> {
+        if (key !== 'dcr_max_clients') throw new Error(`unknown setting: ${key}`);
+        const n = Number(value);
+        if (!Number.isFinite(n) || n <= 0) throw new Error('dcr_max_clients must be a positive number');
+        this.storage.setItem(STORAGE_KEY_DCR_MAX_CLIENTS, String(Math.floor(n)));
+        // Tell Scrypted the device's settings changed so the UI re-fetches via getSettings().
+        await this.onDeviceEvent(ScryptedInterface.Settings, undefined);
     }
 
     private sweepIdleSessions(): void {
@@ -687,12 +738,24 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
     }
 
     private async createSession(): Promise<SessionEntry> {
+        // Forward-declare via a ref cell so the onsessioninitialized closure can capture
+        // the entry before we've built the transport. Today the SDK invokes that callback
+        // async after server.connect has committed the entry, so the original
+        // `const entry = ... after transport` ordering happened to work — but a future SDK
+        // change that invokes it synchronously inside the transport ctor would hit a TDZ
+        // ReferenceError. The .current cell sidesteps that: the closure captures the cell
+        // reference (always defined) and reads .current when invoked.
+        const entryRef: { current?: SessionEntry } = {};
         const transport = new WebStandardStreamableHTTPServerTransport({
             sessionIdGenerator: () => randomUUID(),
             onsessioninitialized: sid => {
                 // The transport calls this once it has assigned a session id — that's when we
                 // commit the entry to the map so subsequent requests can find it.
-                this.sessions.set(sid, entry);
+                if (!entryRef.current) {
+                    this.console.error('[scrypted-mcp] onsessioninitialized fired before entry was built; sid=%s', sid);
+                    return;
+                }
+                this.sessions.set(sid, entryRef.current);
             },
             onsessionclosed: sid => {
                 this.sessions.delete(sid);
@@ -700,6 +763,7 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
         });
         const server = createMcpServer();
         const entry: SessionEntry = { transport, server, lastSeen: Date.now() };
+        entryRef.current = entry;
         transport.onclose = () => {
             // Belt-and-braces against the onsessionclosed callback: if the transport closes
             // for a reason other than a DELETE (e.g. process error), drop the session anyway.

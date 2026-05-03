@@ -34,7 +34,8 @@
         "name": "MCP Server",
         "type": "API",
         "interfaces": [
-            "HttpRequestHandler"
+            "HttpRequestHandler",
+            "Settings"
         ]
     },
     "dependencies": {

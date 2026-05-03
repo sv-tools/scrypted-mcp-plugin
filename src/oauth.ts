@@ -47,6 +47,11 @@ const STORAGE_KEY_REFRESH_TOKEN_PREFIX = 'oauth.rt.';
 interface RegisteredClient {
     client_id: string;
     client_id_issued_at: number;
+    // Updated on /authorize and on every successful /token grant. Drives the LRU eviction
+    // policy when DCR registrations exceed the configured cap. Optional for backward
+    // compatibility with records persisted before this field existed — eviction code falls
+    // back to client_id_issued_at when missing.
+    last_used_at?: number;
     redirect_uris: string[];
     client_name?: string;
     grant_types: string[];
@@ -62,7 +67,6 @@ interface PendingAuthCode {
     codeChallengeMethod: 'S256';
     username: string;
     scope: string;
-    resource?: string;
     expiresAt: number;
 }
 
@@ -76,13 +80,14 @@ interface RefreshTokenRecord {
     // hard-revoke escape hatch.
     sub: string;
     scope: string;
-    resource?: string;
     issuedAt: number; // unix sec
     expiresAt: number; // unix sec
 }
 
-// Scrypted's Storage interface is the synchronous DOM Storage shape (string in, string out).
-type StorageLike = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>;
+// Scrypted's Storage interface is the synchronous DOM Storage shape. We need iteration
+// (length + key(i)) for the periodic sweepers — both the LRU eviction in ClientStore and
+// the expired-RT cleanup in OAuthService — so we widen beyond the basic CRUD trio.
+type StorageLike = Pick<Storage, 'getItem' | 'setItem' | 'removeItem' | 'length' | 'key'>;
 
 // Logger shape we accept from the plugin. Scrypted's Console works; so does any object with
 // the same .log/.error methods. We use it to surface OAuth failures into the plugin's
@@ -202,8 +207,21 @@ function intersectScopes(requested: string): string[] {
 
 // --- Stores ----------------------------------------------------------------
 
+// Persistent registry of DCR-registered clients. /register is unauthenticated and
+// auto-accepts every request, so we cap the total number of registrations to keep an
+// attacker (or a buggy client that re-registers in a loop) from filling plugin storage
+// indefinitely. The cap is configurable via the plugin Settings tab.
+//
+// Eviction policy: LRU keyed by `last_used_at` — the field is touched on every successful
+// /authorize and /token grant, so an active client is safe and a dead registration is the
+// natural victim. Records missing `last_used_at` (registered before the field existed) fall
+// back to `client_id_issued_at` for ordering.
 class ClientStore {
-    constructor(private storage: StorageLike) {}
+    constructor(
+        private storage: StorageLike,
+        private getMaxClients: () => number,
+        private console: ConsoleLike,
+    ) {}
 
     get(clientId: string): RegisteredClient | undefined {
         const raw = this.storage.getItem(STORAGE_KEY_CLIENT_PREFIX + clientId);
@@ -219,7 +237,65 @@ class ClientStore {
     }
 
     set(client: RegisteredClient): void {
+        // New registration path only — touch() is the update path. Enforce the LRU cap
+        // before writing so storage never holds more than `max` entries simultaneously.
+        const max = Math.max(1, this.getMaxClients());
+        const existing = this.list();
+        if (existing.length >= max) {
+            // Evict the oldest entries until we have room for one more. Usually drops a
+            // single record; the loop covers the case where the cap was lowered via
+            // Settings while the store was already over budget.
+            const sorted = existing.sort((a, b) => this.lruKey(a) - this.lruKey(b));
+            const toEvict = sorted.slice(0, existing.length - max + 1);
+            for (const victim of toEvict) {
+                this.storage.removeItem(STORAGE_KEY_CLIENT_PREFIX + victim.client_id);
+                this.console.log(
+                    '[oauth] DCR LRU evict client_id=%s (last_used_at=%d, cap=%d)',
+                    victim.client_id,
+                    this.lruKey(victim),
+                    max,
+                );
+            }
+        }
         this.storage.setItem(STORAGE_KEY_CLIENT_PREFIX + client.client_id, JSON.stringify(client));
+    }
+
+    // Update last_used_at on a client without disturbing any other field. Called from
+    // /authorize (success) and respondWithTokens (any successful grant) so that the LRU
+    // eviction targets actual zombies, not active clients. No-op if the client_id was
+    // already evicted or never existed — we don't want to resurrect a deleted record.
+    touch(clientId: string): void {
+        const existing = this.get(clientId);
+        if (!existing) return;
+        existing.last_used_at = Math.floor(Date.now() / 1000);
+        this.storage.setItem(STORAGE_KEY_CLIENT_PREFIX + clientId, JSON.stringify(existing));
+    }
+
+    // Iterate every persisted client. Storage iteration via length+key(i) — see StorageLike
+    // for the rationale. Skips entries that fail to parse (corrupt records get cleaned up
+    // by get() the next time someone references them).
+    private list(): RegisteredClient[] {
+        const out: RegisteredClient[] = [];
+        try {
+            for (let i = 0; i < this.storage.length; i++) {
+                const key = this.storage.key(i);
+                if (!key || !key.startsWith(STORAGE_KEY_CLIENT_PREFIX)) continue;
+                const raw = this.storage.getItem(key);
+                if (!raw) continue;
+                try {
+                    out.push(JSON.parse(raw) as RegisteredClient);
+                } catch {
+                    // skip — get() will clean up next time
+                }
+            }
+        } catch (e) {
+            this.console.error('[oauth] ClientStore.list iteration failed:', e);
+        }
+        return out;
+    }
+
+    private lruKey(c: RegisteredClient): number {
+        return c.last_used_at ?? c.client_id_issued_at;
     }
 }
 
@@ -287,6 +363,36 @@ class RefreshTokenStore {
         if (record.expiresAt <= Math.floor(Date.now() / 1000)) return undefined;
         return record;
     }
+
+    // Drop expired records. Without this, RTs issued for clients that never come back to
+    // refresh sit in storage for a full TTL (30d) at minimum, and rotated-but-uncollected
+    // records (write-then-overwrite) accumulate behind any consume()-only access pattern.
+    // Returns the count for logging.
+    sweepExpired(): number {
+        const now = Math.floor(Date.now() / 1000);
+        const toDelete: string[] = [];
+        try {
+            for (let i = 0; i < this.storage.length; i++) {
+                const key = this.storage.key(i);
+                if (!key || !key.startsWith(STORAGE_KEY_REFRESH_TOKEN_PREFIX)) continue;
+                const raw = this.storage.getItem(key);
+                if (!raw) continue;
+                try {
+                    const record = JSON.parse(raw) as RefreshTokenRecord;
+                    if (record.expiresAt <= now) toDelete.push(key);
+                } catch {
+                    // Corrupt record — also a cleanup candidate. We'd rather lose a malformed
+                    // RT than carry it forever.
+                    toDelete.push(key);
+                }
+            }
+        } catch (e) {
+            this.console.error('[oauth] RefreshTokenStore.sweepExpired iteration failed:', e);
+            return 0;
+        }
+        for (const key of toDelete) this.storage.removeItem(key);
+        return toDelete.length;
+    }
 }
 
 // --- Signing key -----------------------------------------------------------
@@ -313,7 +419,14 @@ async function loadOrCreateSigningKey(storage: StorageLike): Promise<SigningKey>
 export interface OAuthServiceOptions {
     storage: StorageLike;
     console: ConsoleLike;
+    // Reads the configured DCR client cap from plugin storage. Called per /register so a
+    // settings change applies on the next registration without a plugin reload.
+    getMaxClients: () => number;
 }
+
+// How often the expired-RT sweeper runs. 30 minutes is short enough that storage doesn't
+// drift and long enough that the sweep cost (O(N) over plugin storage keys) is negligible.
+const REFRESH_TOKEN_SWEEP_INTERVAL_MS = 30 * 60 * 1000;
 
 export class OAuthService {
     private clients: ClientStore;
@@ -323,10 +436,17 @@ export class OAuthService {
     private console: ConsoleLike;
 
     constructor(opts: OAuthServiceOptions) {
-        this.clients = new ClientStore(opts.storage);
+        this.console = opts.console;
+        this.clients = new ClientStore(opts.storage, opts.getMaxClients, opts.console);
         this.refreshTokens = new RefreshTokenStore(opts.storage, opts.console);
         this.signing = loadOrCreateSigningKey(opts.storage);
-        this.console = opts.console;
+        // Fire-and-forget the periodic RT cleanup. unref() so the timer doesn't keep the
+        // event loop alive on its own (in-process plugin runs forever anyway, but unref is
+        // the polite default).
+        setInterval(() => {
+            const dropped = this.refreshTokens.sweepExpired();
+            if (dropped > 0) this.console.log('[oauth] swept %d expired refresh token(s)', dropped);
+        }, REFRESH_TOKEN_SWEEP_INTERVAL_MS).unref();
     }
 
     // Compute paths for this request's perspective (origin + plugin root). Centralised
@@ -626,7 +746,7 @@ export class OAuthService {
         const codeChallengeMethod = params.get('code_challenge_method') ?? '';
         const state = params.get('state') ?? '';
         const scopeParam = params.get('scope') ?? SUPPORTED_SCOPES.join(' ');
-        const resource = params.get('resource') ?? undefined;
+        const resourceParam = params.get('resource');
 
         const client = this.clients.get(clientId);
         if (!client) {
@@ -675,6 +795,20 @@ export class OAuthService {
         }
         const scope = scopes.join(' ');
 
+        // RFC 8707: clients can pin a target resource. We only have one — the /mcp endpoint
+        // — and the issued JWT's `aud` claim is always set to that. If a client sends
+        // anything else, fail loud with `invalid_target` instead of silently substituting
+        // ours; otherwise the auth code's bound resource and the token's `aud` would
+        // diverge in ways the client couldn't observe.
+        const ep = this.endpoints(req);
+        if (resourceParam !== null && resourceParam !== ep.resource) {
+            redirectError(
+                'invalid_target',
+                `resource must equal "${ep.resource}" (the only resource this AS issues tokens for)`,
+            );
+            return;
+        }
+
         // Auto-approve — option (a) per the design discussion. The user's Scrypted session
         // is the proof that they meant to grant this. No consent screen.
         const code = this.codes.issue({
@@ -684,9 +818,11 @@ export class OAuthService {
             codeChallengeMethod: 'S256',
             username: req.username,
             scope,
-            resource,
             expiresAt: Date.now() + AUTH_CODE_TTL_MS,
         });
+        // Touch the LRU stamp so an active client doesn't get evicted during a busy /register
+        // burst from another client.
+        this.clients.touch(clientId);
         this.console.log(
             '[oauth] /authorize approved user=%s client_id=%s redirect_uri=%s',
             req.username,
@@ -794,7 +930,6 @@ export class OAuthService {
             sub: pending.username,
             scope: pending.scope,
             clientId,
-            resource: pending.resource,
         });
     }
 
@@ -849,7 +984,6 @@ export class OAuthService {
             sub: record.sub,
             scope,
             clientId,
-            resource: record.resource,
         });
     }
 
@@ -865,7 +999,7 @@ export class OAuthService {
     private async respondWithTokens(
         req: HttpRequest,
         res: HttpResponse,
-        seed: { sub: string; scope: string; clientId: string; resource?: string },
+        seed: { sub: string; scope: string; clientId: string },
     ) {
         const ep = this.endpoints(req);
         const key = await this.signing;
@@ -883,10 +1017,12 @@ export class OAuthService {
             client_id: seed.clientId,
             sub: seed.sub,
             scope: seed.scope,
-            resource: seed.resource,
             issuedAt: now,
             expiresAt: now + REFRESH_TOKEN_TTL_SEC,
         });
+        // Touch the LRU stamp on every successful grant so the client doesn't get evicted
+        // mid-session by a /register burst from a different client.
+        this.clients.touch(seed.clientId);
         this.console.log(
             '[oauth] /token issued user=%s client_id=%s aud=%s access_exp=%d refresh_exp=%d',
             seed.sub,

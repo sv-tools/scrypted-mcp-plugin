@@ -12,6 +12,17 @@ interface BackupComponent {
 // here (rather than in a description string) so the description and the check can't drift.
 const RESTORE_TRIPWIRE = 'RESTORE FROM BACKUP';
 
+// Hard ceiling on accepted restore payload size. A typical Scrypted backup is a few MB to
+// ~100MB; 500MB decoded is generous headroom for large camera/recording databases. Without
+// this, a buggy or malicious client could send a multi-GB base64 string and OOM the plugin
+// process before we even get to the elicitation prompt. Keeping the cap as a constant
+// (rather than configurable) for now — if a real restore needs more, bump this value or
+// promote it to a Settings entry.
+const MAX_RESTORE_BYTES = 500 * 1024 * 1024;
+// base64 inflates by 4/3 plus padding/whitespace slack. Reject the string before we even
+// allocate the decoded Buffer.
+const MAX_RESTORE_BASE64_LEN = Math.ceil((MAX_RESTORE_BYTES * 4) / 3) + 4;
+
 function timestampSlug() {
     return new Date().toISOString().replace(/[:.]/g, '-');
 }
@@ -22,6 +33,11 @@ function timestampSlug() {
 // input doesn't match RFC 4648 standard base64 verbatim (with padding), so we never stage
 // silently-truncated bytes and call `backup.restore()` on them.
 function strictBase64Decode(input: string): Buffer {
+    if (input.length > MAX_RESTORE_BASE64_LEN) {
+        throw new Error(
+            `backupBase64 length ${input.length} exceeds maximum of ${MAX_RESTORE_BASE64_LEN} (decoded cap ${MAX_RESTORE_BYTES} bytes)`,
+        );
+    }
     if (!/^[A-Za-z0-9+/]*={0,2}$/.test(input)) {
         throw new Error('backupBase64 contains characters that are not standard base64 (RFC 4648)');
     }
@@ -29,6 +45,12 @@ function strictBase64Decode(input: string): Buffer {
         throw new Error('backupBase64 length must be a positive multiple of 4 (with padding)');
     }
     const buf = Buffer.from(input, 'base64');
+    // Belt-and-braces post-decode check. The base64 length cap above already gates the
+    // decoded size to within ~3 bytes, but a future change to MAX_RESTORE_BASE64_LEN could
+    // drift; this keeps the decoded-bytes invariant explicit.
+    if (buf.length > MAX_RESTORE_BYTES) {
+        throw new Error(`decoded backup is ${buf.length} bytes; maximum is ${MAX_RESTORE_BYTES}`);
+    }
     // Round-trip: re-encode and compare. Catches edge cases like trailing junk past padding
     // that the regex above lets through (e.g. "AAAA====" passes the char check but won't
     // round-trip).
