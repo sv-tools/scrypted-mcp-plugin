@@ -1,6 +1,6 @@
 # scrypted-mcp
 
-A [Scrypted](https://scrypted.app) plugin that exposes a [Streamable HTTP Model Context Protocol](https://modelcontextprotocol.io/specification/basic/transports#streamable-http) endpoint, with OAuth backed by Scrypted user accounts. AI assistants (Claude Desktop, Claude Code, etc.) connect to your running Scrypted server and call MCP tools to inspect logs, manage plugins, query devices, and snapshot the database.
+A [Scrypted](https://scrypted.app) plugin that exposes a [Streamable HTTP Model Context Protocol](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#streamable-http) endpoint, with OAuth backed by Scrypted user accounts. AI assistants (Claude Desktop, Claude Code, etc.) connect to your running Scrypted server and call MCP tools to inspect logs, manage plugins, query devices, and snapshot the database.
 
 ## Endpoint
 

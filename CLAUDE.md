@@ -92,6 +92,7 @@ Backups travel over the wire as base64 inside MCP `EmbeddedResource` content blo
 - Modifying a Scrypted plugin in development (the *target* one, not this MCP plugin): call `reload_plugin` after pushing code to pick up changes.
 - Modifying this MCP plugin itself: `npm run build` then `npm run scrypted-deploy-debug` to push it. The plugin reloads in place; existing OAuth registrations and the signing key persist via plugin storage.
 - Versioning: bump `package.json`, `package-lock.json` (via `npm install --package-lock-only`), and the `McpServer` literal in `src/main.ts#createMcpServer` together. The publish workflow (`.github/workflows/publish.yml`) verifies the git tag matches.
+- **Published tarball must contain `dist/plugin.zip`** — Scrypted's `installNpm` (`server/src/runtime.ts:608`) reads `files['package/dist/plugin.zip']` and calls `.toString('base64')` on it; if the file is missing, the install fails with `Cannot read properties of undefined (reading 'toString')`. We rely on the `"files": ["dist/plugin.zip"]` whitelist in `package.json` to ensure it lands in the tarball — without that, npm falls back to `.gitignore`, which excludes `dist/` and breaks the install. v1.0.0 / v1.0.1 hit exactly this trap; v1.0.2 added the whitelist.
 
 ## Git
 
