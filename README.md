@@ -1,6 +1,9 @@
 # scrypted-mcp
 
-A [Scrypted](https://scrypted.app) plugin that exposes a [Streamable HTTP Model Context Protocol](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#streamable-http) endpoint, with OAuth backed by Scrypted user accounts. AI assistants (Claude Desktop, Claude Code, etc.) connect to your running Scrypted server and call MCP tools to inspect logs, manage plugins, query devices, and snapshot the database.
+A [Scrypted](https://scrypted.app) plugin that exposes
+a [Streamable HTTP Model Context Protocol](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#streamable-http)
+endpoint, with OAuth backed by Scrypted user accounts. AI assistants (Claude Desktop, Claude Code, etc.) connect to your
+running Scrypted server and call MCP tools to inspect logs, manage plugins, query devices, and snapshot the database.
 
 ## Endpoint
 
@@ -10,22 +13,34 @@ Once installed and the plugin is running, the MCP endpoint is:
 <your-scrypted-base-url>/endpoint/scrypted-mcp/public/mcp
 ```
 
-Use whichever base you use for the Scrypted UI — `https://host:10443` if you're on the secure port, or `http://host:11080` if you're on the insecure one. The plugin auto-detects the protocol from the inbound port (or trusts `x-forwarded-proto` if you have a reverse proxy in front), so OAuth metadata documents come back with URLs your client can actually reach.
+Use whichever base you use for the Scrypted UI — `https://host:10443` if you're on the secure port, or
+`http://host:11080` if you're on the insecure one. The plugin auto-detects the protocol from the inbound port (or trusts
+`x-forwarded-proto` if you have a reverse proxy in front), so OAuth metadata documents come back with URLs your client
+can actually reach.
 
-You don't need to point clients at any other URL — the protected-resource metadata at `/endpoint/scrypted-mcp/public/.well-known/oauth-protected-resource` advertises the authorization server, which advertises `/authorize`, `/token`, `/register`, and the JWKS document.
+You don't need to point clients at any other URL — the protected-resource metadata at
+`/endpoint/scrypted-mcp/public/.well-known/oauth-protected-resource` advertises the authorization server, which
+advertises `/authorize`, `/token`, `/register`, and the JWKS document.
 
 ## Authentication
 
 The plugin is its own OAuth 2.1 Authorization Server. It supports:
 
-- **Dynamic Client Registration** (RFC 7591) — your MCP client registers itself the first time it connects; no manual config needed.
+- **Dynamic Client Registration** (RFC 7591) — your MCP client registers itself the first time it connects; no manual
+  config needed.
 - **Authorization Code + PKCE** (S256) — the only supported flow. Public clients only, no `client_secret`.
-- **ES256 JWT access tokens**, valid 1 hour, signed with an EC P-256 key generated on the plugin's first boot and persisted in plugin storage.
-- **Rotating refresh tokens**, valid 30 days. Every `/token` response includes a fresh `refresh_token`; redeeming one invalidates the previous, so a stolen RT works at most once before the legitimate client's next refresh fails and forces re-auth (surfacing the breach). Refresh tokens persist in plugin storage; wipe it to hard-revoke every chain.
+- **ES256 JWT access tokens**, valid 1 hour, signed with an EC P-256 key generated on the plugin's first boot and
+  persisted in plugin storage.
+- **Rotating refresh tokens**, valid 30 days. Every `/token` response includes a fresh `refresh_token`; redeeming one
+  invalidates the previous, so a stolen RT works at most once before the legitimate client's next refresh fails and
+  forces re-auth (surfacing the breach). Refresh tokens persist in plugin storage; wipe it to hard-revoke every chain.
 
-The login step is just **your existing Scrypted session**. When the MCP client opens `/authorize` in your browser, Scrypted's auth pipeline checks the cookie and populates the username for us. Auto-approve happens immediately — no consent screen.
+The login step is just **your existing Scrypted session**. When the MCP client opens `/authorize` in your browser,
+Scrypted's auth pipeline checks the cookie and populates the username for us. Auto-approve happens immediately — no
+consent screen.
 
-**First-time UX:** if you aren't already logged into the Scrypted UI in the same browser, hitting `/authorize` shows a "log into Scrypted first" hint page. Sign in to Scrypted in another tab, then retry the connection from your MCP client.
+**First-time UX:** if you aren't already logged into the Scrypted UI in the same browser, hitting `/authorize` shows a "
+log into Scrypted first" hint page. Sign in to Scrypted in another tab, then retry the connection from your MCP client.
 
 ## Tools
 
@@ -37,7 +52,8 @@ The login step is just **your existing Scrypted session**. When the MCP client o
 - `kill_plugin` — Kill a plugin host without auto-reload.
 - `install_plugin` — Install / upgrade a plugin from npm.
 - `update_plugins` — Upgrade every installed plugin to its latest npm version.
-- `npm_info` — Query npmjs.org via the Scrypted server. Use `"scrypted-kasa"` for package metadata, or `"-/v1/search?text=keywords:scrypted-plugin"` to discover plugins.
+- `npm_info` — Query npmjs.org via the Scrypted server. Use `"scrypted-kasa"` for package metadata, or
+  `"-/v1/search?text=keywords:scrypted-plugin"` to discover plugins.
 - `rename_device_id` — Rename a Scrypted device id (briefly kills the owning plugin).
 - `set_mixins` — Replace the list of mixins on a device. Read `get_device` first if you only want to add/remove one.
 - `get_storage` / `set_storage` — Read / replace a plugin device's persistent KV storage.
@@ -88,38 +104,48 @@ The login step is just **your existing Scrypted session**. When the MCP client o
 
 ### Backup & restore
 
-- `create_backup` — Snapshot the Scrypted database. Returns the ZIP inline as a base64-encoded `EmbeddedResource` (plus a JSON summary with byte count + sha256) for the agent to save locally. Nothing is written to the Scrypted host filesystem.
-- `restore_backup` — Restore from a base64-encoded backup ZIP. The MCP host decodes it in memory and hands the bytes directly to Scrypted — no tmp file is staged on the host. **Destructive** — wipes the database and installed plugin files.
+- `create_backup` — Snapshot the Scrypted database. Returns the ZIP inline as a base64-encoded `EmbeddedResource` (plus
+  a JSON summary with byte count + sha256) for the agent to save locally. Nothing is written to the Scrypted host
+  filesystem.
+- `restore_backup` — Restore from a base64-encoded backup ZIP. The MCP host decodes it in memory and hands the bytes
+  directly to Scrypted — no tmp file is staged on the host. **Destructive** — wipes the database and installed plugin
+  files.
 
 `restore_backup` is gated three ways before it runs:
 
 1. The `confirm` argument must equal the exact string `RESTORE FROM BACKUP`.
-2. The MCP client must support [elicitation](https://modelcontextprotocol.io/specification/server/elicitation) and the user must explicitly select `RESTORE` in the confirmation dialog. Without elicitation support the tool refuses to run.
+2. The MCP client must support [elicitation](https://modelcontextprotocol.io/specification/server/elicitation) and the
+   user must explicitly select `RESTORE` in the confirmation dialog. Without elicitation support the tool refuses to
+   run.
 3. The tool is annotated `destructiveHint: true` so well-behaved clients require user approval before the call.
 
 The MCP connection drops when the server restarts at the end of a successful restore.
 
 ## Settings
 
-The plugin's Settings tab in the Scrypted UI surfaces both configurable knobs and a live health snapshot. Open **Plugins → MCP Server → Settings** to see them.
+The plugin's Settings tab in the Scrypted UI surfaces both configurable knobs and a live health snapshot. Open *
+*Plugins → MCP Server → Settings** to see them.
 
 ### Endpoint
 
-Two read-only URLs the plugin computes from the live Scrypted listening address — paste whichever one matches how you're reaching Scrypted.
+Two read-only URLs the plugin computes from the live Scrypted listening address — paste whichever one matches how you're
+reaching Scrypted.
 
 - **MCP endpoint URL (HTTPS)** — for production clients and anything behind a reverse proxy.
-- **MCP endpoint URL (HTTP)** — for local-network clients and debugging where the self-signed HTTPS cert is awkward. Don't expose to the internet.
+- **MCP endpoint URL (HTTP)** — for local-network clients and debugging where the self-signed HTTPS cert is awkward.
+  Don't expose to the internet.
 
 ### Configuration
 
-| Setting | Default | Range | What it does |
-| --- | --- | --- | --- |
-| `dcr_max_clients` | 100 | ≥ 1 | Cap on persisted DCR client registrations. When a `/register` would push the total above this, the least-recently-used registration is evicted. |
-| `access_token_ttl_sec` | 3600 (1 h) | 60 – 86400 | Lifetime of issued JWT access tokens. Shorter = tighter security; longer = less re-auth churn. |
+| Setting                 | Default        | Range           | What it does                                                                                                                                      |
+|-------------------------|----------------|-----------------|---------------------------------------------------------------------------------------------------------------------------------------------------|
+| `dcr_max_clients`       | 100            | ≥ 1             | Cap on persisted DCR client registrations. When a `/register` would push the total above this, the least-recently-used registration is evicted.   |
+| `access_token_ttl_sec`  | 3600 (1 h)     | 60 – 86400      | Lifetime of issued JWT access tokens. Shorter = tighter security; longer = less re-auth churn.                                                    |
 | `refresh_token_ttl_sec` | 2592000 (30 d) | 3600 – 31536000 | Lifetime of issued refresh tokens. Each refresh rotates the token (single-use), so this is the upper bound on how long a stolen RT remains valid. |
-| `max_restore_mb` | 500 | 1 – 10240 | Maximum decoded backup size that `restore_backup` will accept. Bump if your Scrypted database exceeds the default. |
+| `max_restore_mb`        | 500            | 1 – 10240       | Maximum decoded backup size that `restore_backup` will accept. Bump if your Scrypted database exceeds the default.                                |
 
-All four values are read at request time, so changes take effect on the next inbound request — no plugin reload required.
+All four values are read at request time, so changes take effect on the next inbound request — no plugin reload
+required.
 
 ### Status
 
@@ -128,7 +154,10 @@ Read-only health fields, refreshed each time the Settings tab is opened.
 - **Active MCP sessions** — In-memory sessions currently held open. Idle sessions are reaped after 1 h.
 - **Registered DCR clients** — Persisted client registrations in plugin storage.
 - **Persisted refresh tokens** — Refresh tokens currently in plugin storage.
-- **Revoke all tokens & disconnect clients** — DESTRUCTIVE button. Drops every refresh token, deletes every DCR registration, rotates the JWT signing key (existing access tokens immediately stop verifying), and closes all active MCP sessions. Every client will need to re-register and re-authenticate. Use it if you suspect a token leak or want to force a clean slate.
+- **Revoke all tokens & disconnect clients** — DESTRUCTIVE button. Drops every refresh token, deletes every DCR
+  registration, rotates the JWT signing key (existing access tokens immediately stop verifying), and closes all active
+  MCP sessions. Every client will need to re-register and re-authenticate. Use it if you suspect a token leak or want to
+  force a clean slate.
 
 ## Install
 
@@ -138,26 +167,10 @@ Search for `scrypted-mcp` in your Scrypted plugin browser, or install via the np
 # from the Scrypted UI: Plugins → Install Plugin → Search npm: scrypted-mcp
 ```
 
-The plugin appears as **MCP Server** under your installed plugins. Click into it to see the endpoint URL in the console output on first boot.
+The plugin appears as **MCP Server** under your installed plugins. Click into it to see the endpoint URL in the console
+output on first boot.
 
 ## Connect
-
-### Claude Desktop
-
-In `Settings → Developer → Edit Config` add (replace the URL with whichever base your Scrypted UI uses — `https://host:10443` or `http://host:11080`):
-
-```json
-{
-  "mcpServers": {
-    "scrypted": {
-      "type": "streamable-http",
-      "url": "https://your-scrypted-host/endpoint/scrypted-mcp/public/mcp"
-    }
-  }
-}
-```
-
-Open the Scrypted UI and sign in (in the same browser Claude Desktop will use for OAuth). Then start a Claude Desktop session — it will redirect you through `/authorize`, register itself, and connect.
 
 ### Claude Code
 
@@ -165,13 +178,53 @@ Open the Scrypted UI and sign in (in the same browser Claude Desktop will use fo
 claude mcp add scrypted --scope=user --transport http https://your-scrypted-host/endpoint/scrypted-mcp/public/mcp
 ```
 
-The first call triggers the OAuth flow in your browser.
+The first call triggers the OAuth flow in your browser. Claude Code runs on your machine, so a LAN-only Scrypted host
+works fine.
+
+### Claude Desktop
+
+> **Only works if your Scrypted server is reachable from the public internet.** Claude Desktop's `streamable-http` MCP
+> support — whether configured via *Settings → Connectors* or *Settings → Developer → Edit Config* — proxies through
+> Anthropic's backend, which cannot reach LAN-only Scrypted hosts. If your server lives behind a Cloudflare Tunnel /
+> Tailscale Funnel / equivalent with a public hostname and real TLS, follow the steps below; otherwise stick with Claude
+> Code.
+
+In `Settings → Developer → Edit Config` add:
+
+```json
+{
+  "mcpServers": {
+    "scrypted": {
+      "type": "streamable-http",
+      "url": "https://your-public-scrypted-host/endpoint/scrypted-mcp/public/mcp"
+    }
+  }
+}
+```
+
+Open the Scrypted UI and sign in (in the same browser Claude Desktop will use for OAuth). Then start a Claude Desktop
+session — it will redirect you through `/authorize`, register itself, and connect.
 
 ## Troubleshooting
 
-If your MCP client logs `HTTP 404 ... Cannot POST /register` (or any other path at the host root), the plugin's OAuth metadata advertised URLs your client couldn't reach. Most often this means the protocol got mis-detected — check that your client's URL matches the port (https → 10443, http → 11080) and that nothing in front of Scrypted is rewriting `Host` without forwarding `x-forwarded-proto`.
+If your MCP client logs `HTTP 404 ... Cannot POST /register` (or any other path at the host root), the plugin's OAuth
+metadata advertised URLs your client couldn't reach. Most often this means the protocol got mis-detected — check that
+your client's URL matches the port (https → 10443, http → 11080) and that nothing in front of Scrypted is rewriting
+`Host` without forwarding `x-forwarded-proto`.
 
-After fixing the URL, re-run `claude mcp remove scrypted` and re-add it (or equivalent for your client) to clear any cached OAuth discovery state.
+After fixing the URL, re-run `claude mcp remove scrypted` and re-add it (or equivalent for your client) to clear any
+cached OAuth discovery state.
+
+### Claude Code: re-auth after a connection loss
+
+If the connection drops and you clear the stored credentials in Claude Code (`/mcp` → Scrypted → *Clear authentication*),
+**click *Reconnect* before *Authenticate***. Otherwise the auth flow fails with a discovery 404.
+
+Why: the MCP SDK only learns where this plugin's Authorization Server lives by reading the
+`WWW-Authenticate: Bearer resource_metadata="..."` header that `/mcp` returns on a 401. *Reconnect* triggers a fresh POST
+that produces that 401 and caches the metadata URL; *Authenticate* alone uses whatever discovery state was already
+cached, and after a *Clear authentication* there is none — so it falls back to default URLs at the host root, which
+Scrypted's root Express returns 404 for. Reconnect first → metadata cached → Authenticate succeeds.
 
 ## Develop
 
