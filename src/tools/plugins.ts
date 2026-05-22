@@ -97,7 +97,10 @@ export const updatePluginsInput = z.object({});
 
 export async function updatePlugins() {
     const plugins = await getComponent<PluginComponent>('plugins');
-    return plugins.updatePlugins();
+    // updatePlugins resolves void on the Scrypted side, so return a confirmation object —
+    // a bare undefined would JSON.stringify to undefined and fail the MCP content schema.
+    const result = await plugins.updatePlugins();
+    return result ?? { updated: true };
 }
 
 export const renameDeviceIdInput = z.object({
