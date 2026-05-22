@@ -112,7 +112,10 @@ function wrap<TArgs, TResult>(handler: (args: TArgs) => Promise<TResult>, opts: 
         try {
             const result = await handler(args);
             if (opts.rawContent) return result as any;
-            return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] };
+            // A void/undefined handler result makes JSON.stringify return the JS value
+            // `undefined` (not a string), which yields { text: undefined } and fails the MCP
+            // content union schema. Coerce to null so we always emit a valid text block.
+            return { content: [{ type: 'text' as const, text: JSON.stringify(result ?? null, null, 2) }] };
         } catch (e: any) {
             return {
                 isError: true,
@@ -132,7 +135,7 @@ function wrap<TArgs, TResult>(handler: (args: TArgs) => Promise<TResult>, opts: 
 // instance directly.
 function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
     const server = new McpServer(
-        { name: 'scrypted-mcp', version: '1.0.2' },
+        { name: 'scrypted-mcp', version: '1.0.3' },
         {
             instructions: [
                 'This MCP server runs inside a Scrypted plugin and controls the same Scrypted server (https://scrypted.app).',
