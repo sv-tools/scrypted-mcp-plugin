@@ -61,7 +61,7 @@ export async function getDevice(args: z.infer<typeof getDeviceInput>) {
 }
 
 export const callDeviceMethodInput = z.object({
-    id: z.string().describe('Scrypted device id.'),
+    id: z.string().describe('Scrypted device id (the `id` field from list_devices).'),
     method: z.string().describe('Method name on the device (e.g. "turnOn", "setBrightness", "getSettings").'),
     args: z.array(z.any()).optional().describe('Positional arguments to pass to the method. Omit if none.'),
 });

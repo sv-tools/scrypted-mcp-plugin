@@ -53,7 +53,7 @@ export async function listPlugins() {
 }
 
 export const getPluginInfoInput = z.object({
-    pluginId: z.string().describe('npm package id of the plugin, e.g. "scrypted-kasa".'),
+    pluginId: z.string().describe('npm package id — the `pluginId` field from list_plugins, e.g. "scrypted-kasa".'),
 });
 
 export async function getPluginInfo(args: z.infer<typeof getPluginInfoInput>) {
@@ -63,7 +63,9 @@ export async function getPluginInfo(args: z.infer<typeof getPluginInfoInput>) {
 }
 
 export const reloadPluginInput = z.object({
-    pluginId: z.string().describe('npm package id of the plugin to reload.'),
+    pluginId: z
+        .string()
+        .describe('npm package id to reload — the `pluginId` field from list_plugins, e.g. "scrypted-kasa".'),
 });
 
 export async function reloadPlugin(args: z.infer<typeof reloadPluginInput>) {
@@ -73,7 +75,9 @@ export async function reloadPlugin(args: z.infer<typeof reloadPluginInput>) {
 }
 
 export const killPluginInput = z.object({
-    pluginId: z.string().describe('npm package id of the plugin to kill (without reload).'),
+    pluginId: z
+        .string()
+        .describe('npm package id to kill — the `pluginId` field from list_plugins, e.g. "scrypted-kasa".'),
 });
 
 export async function killPlugin(args: z.infer<typeof killPluginInput>) {
@@ -104,7 +108,7 @@ export async function updatePlugins() {
 }
 
 export const renameDeviceIdInput = z.object({
-    id: z.string().describe('Current Scrypted device id.'),
+    id: z.string().describe('Current Scrypted device id (the `id` field from list_devices or list_plugins).'),
     newId: z.string().describe('New device id. Must not collide with an existing device.'),
 });
 
@@ -117,7 +121,9 @@ export async function renameDeviceId(args: z.infer<typeof renameDeviceIdInput>) 
 }
 
 export const setMixinsInput = z.object({
-    id: z.string().describe('Scrypted device id whose mixins to replace.'),
+    id: z
+        .string()
+        .describe('Scrypted device id whose mixins to replace (the `id` field from list_devices or list_plugins).'),
     mixins: z
         .array(z.string())
         .describe(
@@ -147,7 +153,11 @@ export async function npmInfo(args: z.infer<typeof npmInfoInput>) {
 }
 
 export const getStorageInput = z.object({
-    id: z.string().describe('Scrypted device id whose persistent storage to read.'),
+    id: z
+        .string()
+        .describe(
+            'Scrypted device id whose persistent storage to read (the `id` field from list_devices or list_plugins).',
+        ),
 });
 
 export async function getStorage(args: z.infer<typeof getStorageInput>) {
@@ -158,7 +168,11 @@ export async function getStorage(args: z.infer<typeof getStorageInput>) {
 }
 
 export const setStorageInput = z.object({
-    id: z.string().describe('Scrypted device id whose persistent storage to overwrite.'),
+    id: z
+        .string()
+        .describe(
+            'Scrypted device id whose persistent storage to overwrite (the `id` field from list_devices or list_plugins).',
+        ),
     storage: z
         .record(z.string(), z.string())
         .describe(
@@ -174,7 +188,11 @@ export async function setStorage(args: z.infer<typeof setStorageInput>) {
 }
 
 export const getIdForNativeIdInput = z.object({
-    pluginId: z.string().describe('npm package id of the owning plugin (e.g. "scrypted-kasa").'),
+    pluginId: z
+        .string()
+        .describe(
+            'npm package id of the owning plugin — the `pluginId` field from list_plugins, e.g. "scrypted-kasa".',
+        ),
     nativeId: z
         .string()
         .optional()
@@ -190,7 +208,9 @@ export async function getIdForNativeId(args: z.infer<typeof getIdForNativeIdInpu
 }
 
 export const disconnectClientsInput = z.object({
-    pluginId: z.string().describe('npm package id of the plugin whose websocket clients to disconnect.'),
+    pluginId: z
+        .string()
+        .describe('npm package id whose websocket clients to disconnect — the `pluginId` field from list_plugins.'),
 });
 
 export async function disconnectClients(args: z.infer<typeof disconnectClientsInput>) {
@@ -200,7 +220,11 @@ export async function disconnectClients(args: z.infer<typeof disconnectClientsIn
 }
 
 export const clearConsoleInput = z.object({
-    id: z.string().describe('Scrypted device id whose console buffer to clear.'),
+    id: z
+        .string()
+        .describe(
+            'Scrypted device id whose console buffer to clear (the `id` field from list_devices or list_plugins).',
+        ),
 });
 
 export async function clearConsole(args: z.infer<typeof clearConsoleInput>) {

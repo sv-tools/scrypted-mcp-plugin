@@ -41,7 +41,9 @@ export async function setLocalAddresses(args: z.infer<typeof setLocalAddressesIn
 }
 
 export const getExternalAddressesInput = z.object({
-    id: z.string().describe('Plugin device id whose external addresses to fetch.'),
+    id: z
+        .string()
+        .describe('Plugin endpoint id whose external addresses to fetch — the plugin device `id` from list_plugins.'),
 });
 
 export async function getExternalAddresses(args: z.infer<typeof getExternalAddressesInput>) {
@@ -51,7 +53,7 @@ export async function getExternalAddresses(args: z.infer<typeof getExternalAddre
 }
 
 export const setExternalAddressesInput = z.object({
-    id: z.string().describe('Plugin device id.'),
+    id: z.string().describe('Plugin endpoint id — the plugin device `id` from list_plugins.'),
     addresses: z
         .array(z.string())
         .describe('Replacement list of external (publicly reachable) URLs/addresses for this plugin.'),
@@ -64,7 +66,9 @@ export async function setExternalAddresses(args: z.infer<typeof setExternalAddre
 }
 
 export const getCorsInput = z.object({
-    id: z.string().describe('Plugin/endpoint id whose CORS allowlist to fetch.'),
+    id: z
+        .string()
+        .describe('Plugin endpoint id whose CORS allowlist to fetch — the plugin device `id` from list_plugins.'),
 });
 
 export async function getCors(args: z.infer<typeof getCorsInput>) {
@@ -74,7 +78,7 @@ export async function getCors(args: z.infer<typeof getCorsInput>) {
 }
 
 export const setCorsInput = z.object({
-    id: z.string().describe('Plugin/endpoint id.'),
+    id: z.string().describe('Plugin endpoint id — the plugin device `id` from list_plugins.'),
     origins: z.array(z.string()).describe('Replacement list of allowed CORS origins for this endpoint.'),
 });
 

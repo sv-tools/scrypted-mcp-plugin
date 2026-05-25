@@ -135,17 +135,19 @@ function wrap<TArgs, TResult>(handler: (args: TArgs) => Promise<TResult>, opts: 
 // instance directly.
 function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
     const server = new McpServer(
-        { name: 'scrypted-mcp', version: '1.0.4' },
+        { name: 'scrypted-mcp', version: '1.0.5' },
         {
             instructions: [
                 'This MCP server runs inside a Scrypted plugin and controls the same Scrypted server (https://scrypted.app).',
-                'Inspect: list_plugins / get_plugin_info / get_logs / get_server_info.',
-                'Devices: list_devices / get_device / call_device_method (any RPC method).',
-                'Plugin lifecycle: reload_plugin (after code changes), install_plugin, update_plugins, kill_plugin.',
+                'Inspect: list_plugins / get_plugin_info / get_logs / get_server_info / npm_info.',
+                'Devices: list_devices / get_device / call_device_method (any RPC method); resolve nativeIds with get_id_for_native_id.',
+                'Plugin lifecycle: reload_plugin (after code changes), install_plugin, update_plugins, kill_plugin, disconnect_clients, clear_console.',
+                'Device config: get_storage / set_storage (KV storage), set_mixins, rename_device_id.',
                 'Server admin: restart_server, update_server, get_dotenv / set_dotenv, list_users / add_user / remove_user.',
-                'Network: get_local_addresses / set_local_addresses, get_cors / set_cors.',
-                'Alerts and cluster: list_alerts, list_cluster_workers.',
+                'Network: get_local_addresses / set_local_addresses, get_external_addresses / set_external_addresses, get_cors / set_cors.',
+                'Alerts and cluster: list_alerts / remove_alert / clear_alerts, clear_logs, list_cluster_workers.',
                 'Backup: create_backup returns the ZIP inline as a base64 blob; restore_backup takes a base64 blob input and is destructive (triggers a user confirmation prompt).',
+                'Tool annotations are set: prefer readOnly tools freely; destructive tools (set_*, clear_*, remove_*, kill_*, restart/update_server, restore_backup) should be surfaced to the user first.',
                 'Logs are retained ~48h; pass `sinceMs` to focus on a recent window.',
             ].join(' '),
         },
@@ -154,8 +156,15 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
     server.registerTool(
         'list_plugins',
         {
-            description: 'List installed Scrypted plugins (id, npm pluginId, name, type).',
+            description:
+                'List installed Scrypted plugins. Returns for each: Scrypted device `id`, npm `pluginId` (the id passed to reload_plugin / get_plugin_info / kill_plugin), name, and type.',
             inputSchema: listPluginsInput.shape,
+            annotations: {
+                title: 'List plugins',
+                readOnlyHint: true,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
         },
         wrap(listPlugins),
     );
@@ -165,6 +174,12 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         {
             description: 'Inspect a plugin: pid, pending RPC calls, object count, etc.',
             inputSchema: getPluginInfoInput.shape,
+            annotations: {
+                title: 'Get plugin info',
+                readOnlyHint: true,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
         },
         wrap(getPluginInfo),
     );
@@ -174,6 +189,13 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         {
             description: 'Restart a plugin host process (preserves state, picks up code changes).',
             inputSchema: reloadPluginInput.shape,
+            annotations: {
+                title: 'Reload plugin',
+                destructiveHint: false,
+                idempotentHint: true,
+                readOnlyHint: false,
+                openWorldHint: false,
+            },
         },
         wrap(reloadPlugin),
     );
@@ -181,8 +203,16 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
     server.registerTool(
         'kill_plugin',
         {
-            description: 'Kill a plugin host without auto-reload. Use sparingly.',
+            description:
+                'Kill a plugin host without auto-reload — the plugin stays down until you call reload_plugin or the server restarts. Prefer reload_plugin unless you specifically need it stopped.',
             inputSchema: killPluginInput.shape,
+            annotations: {
+                title: 'Kill plugin',
+                destructiveHint: true,
+                idempotentHint: true,
+                readOnlyHint: false,
+                openWorldHint: false,
+            },
         },
         wrap(killPlugin),
     );
@@ -192,6 +222,13 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         {
             description: 'Install (or upgrade) a plugin from npm. Returns the plugin device id.',
             inputSchema: installPluginInput.shape,
+            annotations: {
+                title: 'Install plugin',
+                destructiveHint: false,
+                idempotentHint: false,
+                readOnlyHint: false,
+                openWorldHint: true,
+            },
         },
         wrap(installPlugin),
     );
@@ -201,6 +238,13 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         {
             description: 'Check all installed plugins against npm and upgrade any that are outdated.',
             inputSchema: updatePluginsInput.shape,
+            annotations: {
+                title: 'Update plugins',
+                destructiveHint: false,
+                idempotentHint: true,
+                readOnlyHint: false,
+                openWorldHint: true,
+            },
         },
         wrap(updatePlugins),
     );
@@ -227,6 +271,13 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
             description:
                 'Rename a Scrypted device id. Briefly kills the owning plugin host while it rewrites references — expect a short offline window.',
             inputSchema: renameDeviceIdInput.shape,
+            annotations: {
+                title: 'Rename device id',
+                destructiveHint: true,
+                idempotentHint: false,
+                readOnlyHint: false,
+                openWorldHint: false,
+            },
         },
         wrap(renameDeviceId),
     );
@@ -319,7 +370,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
             inputSchema: clearConsoleInput.shape,
             annotations: {
                 title: 'Clear device console',
-                destructiveHint: false,
+                destructiveHint: true,
                 idempotentHint: true,
                 readOnlyHint: false,
                 openWorldHint: false,
@@ -331,8 +382,15 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
     server.registerTool(
         'get_logs',
         {
-            description: 'Fetch retained server-side logs. Filter by component (substring match), level, sinceMs.',
+            description:
+                'Fetch retained server-side logs (newest first). Filter by component (substring match), level, sinceMs. Results are capped (`truncated: true` when more matched) — narrow the filters or raise `limit` to see the rest.',
             inputSchema: getLogsInput.shape,
+            annotations: {
+                title: 'Get logs',
+                readOnlyHint: true,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
         },
         wrap(getLogs),
     );
@@ -342,6 +400,13 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         {
             description: 'Clear the server-side log buffer. Returns { cleared: true } on success.',
             inputSchema: clearLogsInput.shape,
+            annotations: {
+                title: 'Clear logs',
+                destructiveHint: true,
+                idempotentHint: true,
+                readOnlyHint: false,
+                openWorldHint: false,
+            },
         },
         wrap(clearLogs),
     );
@@ -350,8 +415,14 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         'list_alerts',
         {
             description:
-                'List Scrypted alerts (newest first). Alerts are persisted notices like plugin crashes or warnings.',
+                'List Scrypted alerts (newest first). Alerts are persisted notices like plugin crashes or warnings. Results are capped (`truncated: true` when more matched) — raise `limit` to see the rest.',
             inputSchema: listAlertsInput.shape,
+            annotations: {
+                title: 'List alerts',
+                readOnlyHint: true,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
         },
         wrap(listAlerts),
     );
@@ -361,6 +432,13 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         {
             description: 'Remove a single alert by id (use the `id` field from list_alerts).',
             inputSchema: removeAlertInput.shape,
+            annotations: {
+                title: 'Remove alert',
+                destructiveHint: true,
+                idempotentHint: true,
+                readOnlyHint: false,
+                openWorldHint: false,
+            },
         },
         wrap(removeAlert),
     );
@@ -370,6 +448,13 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         {
             description: 'Remove all alerts. Returns { cleared: true } on success.',
             inputSchema: clearAlertsInput.shape,
+            annotations: {
+                title: 'Clear alerts',
+                destructiveHint: true,
+                idempotentHint: true,
+                readOnlyHint: false,
+                openWorldHint: false,
+            },
         },
         wrap(clearAlerts),
     );
@@ -379,6 +464,12 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         {
             description: 'List devices on the Scrypted server. Filter by interface, type, or name substring.',
             inputSchema: listDevicesInput.shape,
+            annotations: {
+                title: 'List devices',
+                readOnlyHint: true,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
         },
         wrap(listDevices),
     );
@@ -386,8 +477,15 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
     server.registerTool(
         'get_device',
         {
-            description: 'Get a snapshot of every state property on a device.',
+            description:
+                'Get a snapshot of every state property on a device. Returns the full state map, which can be large for cameras; the `interfaces` array tells you which methods call_device_method can invoke.',
             inputSchema: getDeviceInput.shape,
+            annotations: {
+                title: 'Get device',
+                readOnlyHint: true,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
         },
         wrap(getDevice),
     );
@@ -396,8 +494,11 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         'call_device_method',
         {
             description:
-                'Invoke a method on a device (e.g. turnOn, setBrightness, getSettings). Returns the JSON-serialized result.',
+                "Invoke a method on a device (e.g. turnOn, setBrightness, getSettings). The available methods follow from the device's `interfaces` — call get_device first if unsure. May read or mutate depending on the method. Returns the JSON-serialized result.",
             inputSchema: callDeviceMethodInput.shape,
+            annotations: {
+                title: 'Call device method',
+            },
         },
         wrap(callDeviceMethod),
     );
@@ -407,6 +508,12 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         {
             description: 'Get Scrypted server version and SCRYPTED_* environment variables.',
             inputSchema: getServerInfoInput.shape,
+            annotations: {
+                title: 'Get server info',
+                readOnlyHint: true,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
         },
         wrap(getServerInfo),
     );
@@ -416,6 +523,13 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         {
             description: 'Restart the Scrypted server. The current MCP connection will drop and need to reconnect.',
             inputSchema: restartServerInput.shape,
+            annotations: {
+                title: 'Restart server',
+                destructiveHint: true,
+                idempotentHint: false,
+                readOnlyHint: false,
+                openWorldHint: false,
+            },
         },
         wrap(restartServer),
     );
@@ -424,8 +538,15 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         'update_server',
         {
             description:
-                'Trigger a Scrypted server update. Honors SCRYPTED_WEBHOOK_UPDATE if set, otherwise writes .update and restarts.',
+                'Trigger a Scrypted server update. Honors SCRYPTED_WEBHOOK_UPDATE if set, otherwise writes .update and restarts. Returns immediately; the server restarts asynchronously and the MCP connection will drop, like restart_server.',
             inputSchema: updateServerInput.shape,
+            annotations: {
+                title: 'Update server',
+                destructiveHint: true,
+                idempotentHint: false,
+                readOnlyHint: false,
+                openWorldHint: true,
+            },
         },
         wrap(updateServer),
     );
@@ -436,6 +557,12 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
             description:
                 'Read the contents of the Scrypted .env file. Returns empty content if the file does not exist.',
             inputSchema: getDotEnvInput.shape,
+            annotations: {
+                title: 'Get .env',
+                readOnlyHint: true,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
         },
         wrap(getDotEnv),
     );
@@ -446,6 +573,13 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
             description:
                 'Overwrite the Scrypted .env file. The provided content is written verbatim — include all keys you want to keep.',
             inputSchema: setDotEnvInput.shape,
+            annotations: {
+                title: 'Set .env',
+                destructiveHint: true,
+                idempotentHint: true,
+                readOnlyHint: false,
+                openWorldHint: false,
+            },
         },
         wrap(setDotEnv),
     );
@@ -455,6 +589,12 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         {
             description: 'List Scrypted user accounts (username + admin flag).',
             inputSchema: listUsersInput.shape,
+            annotations: {
+                title: 'List users',
+                readOnlyHint: true,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
         },
         wrap(listUsers),
     );
@@ -464,6 +604,13 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         {
             description: 'Create a new Scrypted user. Omit aclId to create an admin.',
             inputSchema: addUserInput.shape,
+            annotations: {
+                title: 'Add user',
+                destructiveHint: false,
+                idempotentHint: false,
+                readOnlyHint: false,
+                openWorldHint: false,
+            },
         },
         wrap(addUser),
     );
@@ -473,6 +620,13 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         {
             description: 'Delete a Scrypted user by username.',
             inputSchema: removeUserInput.shape,
+            annotations: {
+                title: 'Remove user',
+                destructiveHint: true,
+                idempotentHint: true,
+                readOnlyHint: false,
+                openWorldHint: false,
+            },
         },
         wrap(removeUser),
     );
@@ -482,6 +636,12 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         {
             description: 'Get the configured local addresses / interface names that Scrypted advertises.',
             inputSchema: getLocalAddressesInput.shape,
+            annotations: {
+                title: 'Get local addresses',
+                readOnlyHint: true,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
         },
         wrap(getLocalAddresses),
     );
@@ -491,6 +651,13 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         {
             description: 'Replace the configured local addresses. Pass interface names ("en0") or IPs.',
             inputSchema: setLocalAddressesInput.shape,
+            annotations: {
+                title: 'Set local addresses',
+                destructiveHint: true,
+                idempotentHint: true,
+                readOnlyHint: false,
+                openWorldHint: false,
+            },
         },
         wrap(setLocalAddresses),
     );
@@ -500,6 +667,12 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         {
             description: 'Get the configured external (publicly reachable) addresses for a plugin endpoint.',
             inputSchema: getExternalAddressesInput.shape,
+            annotations: {
+                title: 'Get external addresses',
+                readOnlyHint: true,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
         },
         wrap(getExternalAddresses),
     );
@@ -509,6 +682,13 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         {
             description: 'Replace the configured external addresses for a plugin endpoint.',
             inputSchema: setExternalAddressesInput.shape,
+            annotations: {
+                title: 'Set external addresses',
+                destructiveHint: true,
+                idempotentHint: true,
+                readOnlyHint: false,
+                openWorldHint: false,
+            },
         },
         wrap(setExternalAddresses),
     );
@@ -518,6 +698,12 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         {
             description: 'Get the CORS origin allowlist for a plugin endpoint.',
             inputSchema: getCorsInput.shape,
+            annotations: {
+                title: 'Get CORS allowlist',
+                readOnlyHint: true,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
         },
         wrap(getCors),
     );
@@ -527,6 +713,13 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         {
             description: 'Replace the CORS origin allowlist for a plugin endpoint.',
             inputSchema: setCorsInput.shape,
+            annotations: {
+                title: 'Set CORS allowlist',
+                destructiveHint: true,
+                idempotentHint: true,
+                readOnlyHint: false,
+                openWorldHint: false,
+            },
         },
         wrap(setCors),
     );
@@ -536,6 +729,12 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         {
             description: 'List registered Scrypted cluster worker nodes (id, name, labels, mode, address, fork count).',
             inputSchema: listClusterWorkersInput.shape,
+            annotations: {
+                title: 'List cluster workers',
+                readOnlyHint: true,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
         },
         wrap(listClusterWorkers),
     );
