@@ -19,13 +19,19 @@ interface EnvControlComponent {
 
 export const getServerInfoInput = z.object({});
 
+// Keys matching this pattern are redacted from get_server_info responses.
+// Credentials in env vars (tokens, secrets, passwords, API keys) must not be
+// returned to MCP clients — the tool is read-only and informational only.
+const SENSITIVE_ENV_KEY = /TOKEN|SECRET|PASSWORD|KEY/i;
+
 export async function getServerInfo() {
     // Combine version + SCRYPTED_* env into one snapshot — saves a round-trip when the LLM
     // wants to know "what server am I talking to". `getUpdateAvailable` is intentionally
     // skipped here: the upstream impl throws "not implemented" by design (updates ride
     // through Docker/npm out-of-band), so calling it just produces noise.
     const info = await getComponent<InfoComponent>('info');
-    const [version, env] = await Promise.all([info.getVersion(), info.getScryptedEnv()]);
+    const [version, rawEnv] = await Promise.all([info.getVersion(), info.getScryptedEnv()]);
+    const env = Object.fromEntries(Object.entries(rawEnv).filter(([k]) => !SENSITIVE_ENV_KEY.test(k)));
     return { version, env };
 }
 
