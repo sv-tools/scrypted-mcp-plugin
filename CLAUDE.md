@@ -25,6 +25,13 @@ The plugin is one process inside Scrypted. `src/main.ts` declares `ScryptedMcpPl
 
 `src/http-bridge.ts` is the only adapter between Scrypted's `HttpRequest`/`HttpResponse` and Web-standard `Request`/`Response`. Streamed responses (Content-Type: `text/event-stream`) flow through `HttpResponse.sendStream(AsyncGenerator<Buffer>)`; everything else buffers and `send`s.
 
+Two SSE behaviours are inherited from the MCP SDK transport (since 1.30.0) rather than implemented here, and both depend on the bridge staying byte- and header-transparent:
+
+- **Keep-alive.** The transport writes `: keepalive` comment frames into the SSE stream every 15s (`keepAliveMs`, default `DEFAULT_SSE_KEEP_ALIVE_MS`). This is what stops a reverse proxy from reaping a stream that idles during a long tool call — `create_backup` on a large database, and especially the `restore_backup` elicitation round-trip, which idles for as long as the human takes to answer. `readableStreamToBufferGenerator` must therefore keep forwarding every non-empty chunk; the only chunks it may drop are zero-length ones.
+- **Proxy hints.** The transport sets `X-Accel-Buffering: no` and `Cache-Control: no-cache, no-transform` on SSE responses. These reach the client only because `fromWebResponse` copies the full header set through `headersToPlain` — don't switch it to an allowlist of known headers.
+
+Request `Content-Type` is validated by parsed media type, not substring match, so `application/json` and `application/json; charset=utf-8` both pass but a comma-joined duplicate header 415s.
+
 `src/scrypted.ts` is a thin `getComponent(name)` wrapper around `sdk.systemManager.getComponent(...)` plus re-exports of `systemManager` / `deviceManager` / `mediaManager`. Tools that previously went through `@scrypted/client` now hit the SDK directly.
 
 ## OAuth
