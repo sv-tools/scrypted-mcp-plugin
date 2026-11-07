@@ -369,7 +369,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         'read_console',
         {
             description:
-                "Read a device's console (the same output as its Console tab in the Scrypted UI), newest at the end. Includes output from the device's mixins, e.g. HomeKit. Use maxChars to limit the tail.",
+                "Read a device's console (the same output as its Console tab in the Scrypted UI), newest at the end. Includes output from the device's mixins, e.g. HomeKit. Credentials in URLs, auth headers and token/password values are redacted. Use maxChars to limit the tail.",
             inputSchema: readConsoleInput.shape,
             annotations: {
                 title: 'Read device console',

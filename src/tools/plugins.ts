@@ -253,6 +253,31 @@ export const readConsoleInput = z.object({
 
 // eslint-disable-next-line no-control-regex
 const ANSI_ESCAPE = /\x1b\[[0-9;]*[A-Za-z]/g;
+
+// Consoles can carry credentials (camera URLs with user:pass, auth headers, tokens in query
+// strings or logged objects). Tool output ends up in the model's context, so redact the common
+// shapes before returning, the same reasoning as get_server_info's env filtering.
+const SECRET_PATTERNS: Array<[RegExp, string]> = [
+    // rtsp(s)://host/<path>: stream paths often are the credential (UniFi Protect's
+    // rtsps://host:7441/<token>), so keep the host for debugging and drop the path.
+    [/\b(rtsps?:\/\/[^\s/'"]+\/)[^\s'"]+/gi, '$1[REDACTED]'],
+    // scheme://user:password@host -> scheme://[REDACTED]@host
+    [/\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]+@/gi, '$1[REDACTED]@'],
+    // Authorization: Bearer xyz / Basic xyz
+    [/\b(authorization\s*[:=]\s*["']?)(?:bearer|basic|digest)?\s*[^\s"',]+/gi, '$1[REDACTED]'],
+    // bare bearer tokens
+    [/\b(bearer\s+)[a-z0-9._~+/-]+=*/gi, '$1[REDACTED]'],
+    // token=..., password: '...', api_key=..., client_secret=...
+    [
+        /\b((?:access_|refresh_|id_|api_|auth_|session_)?token|password|passwd|pwd|secret|client_secret|api_?key)(["']?\s*[:=]\s*["']?)[^\s"'&,;}]+/gi,
+        '$1$2[REDACTED]',
+    ],
+];
+
+export function redactSecrets(text: string): string {
+    for (const [pattern, replacement] of SECRET_PATTERNS) text = text.replace(pattern, replacement);
+    return text;
+}
 const PORT_READ_IDLE_MS = 250;
 const PORT_READ_MAX_MS = 5000;
 const PORT_READ_MAX_BYTES = 8 * 1024 * 1024;
@@ -303,7 +328,7 @@ export async function readConsole(args: z.infer<typeof readConsoleInput>) {
         const [port, host] = await plugins.getRemoteServicePort(dev.pluginId, 'console');
         text = await readConsoleViaPort(port, host || '127.0.0.1', dev.nativeId);
     }
-    text = text.replace(ANSI_ESCAPE, '');
+    text = redactSecrets(text.replace(ANSI_ESCAPE, ''));
     const max = args.maxChars ?? 50_000;
     const truncated = text.length > max;
     return { id: args.id, truncated, console: truncated ? text.slice(-max) : text };
