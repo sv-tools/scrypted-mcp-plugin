@@ -257,26 +257,50 @@ const ANSI_ESCAPE = /\x1b\[[0-9;]*[A-Za-z]/g;
 // Consoles can carry credentials (camera URLs with user:pass, auth headers, tokens in query
 // strings or logged objects). Tool output ends up in the model's context, so redact the common
 // shapes before returning, the same reasoning as get_server_info's env filtering.
-// Every quantifier is bounded so the scan stays linear on long runs of token-like text
-// (base64 blobs, hex dumps); readConsole also trims to the requested tail before redacting.
+// Value runs after a fixed anchor (a keyword, or rtsp://host/) are unbounded: each match starts
+// at the anchor and a global replace resumes after it, so the scan is linear and a long secret
+// is redacted whole. The only bounded parts are those where a match could start at many places.
 const SECRET_PATTERNS: Array<[RegExp, string]> = [
     // rtsp(s)://host/<path>: stream paths often are the credential (UniFi Protect's
     // rtsps://host:7441/<token>), so keep the host for debugging and drop the path.
-    [/\b(rtsps?:\/\/[^\s/'"]{1,255}\/)[^\s'"]{1,2048}/gi, '$1[REDACTED]'],
-    // scheme://user:password@host -> scheme://[REDACTED]@host
-    [/(?<![a-z0-9+.-])([a-z][a-z0-9+.-]{0,31}:\/\/)[^\s/@:]{1,256}:[^\s/@]{1,256}@/gi, '$1[REDACTED]@'],
+    [/\b(rtsps?:\/\/[^\s/'"]{1,255}\/)[^\s'"]+/gi, '$1[REDACTED]'],
     // Authorization: Bearer xyz / Basic xyz
-    [/\b(authorization\s{0,8}[:=]\s{0,8}["']?)(?:bearer|basic|digest)?\s{0,8}[^\s"',]{1,4096}/gi, '$1[REDACTED]'],
+    [/\b(authorization\s{0,8}[:=]\s{0,8}["']?)(?:bearer|basic|digest)?\s{0,8}[^\s"',]+/gi, '$1[REDACTED]'],
     // bare bearer tokens
-    [/\b(bearer\s{1,8})[a-z0-9._~+/-]{1,4096}={0,2}/gi, '$1[REDACTED]'],
+    [/\b(bearer\s{1,8})[a-z0-9._~+/-]+=*/gi, '$1[REDACTED]'],
     // token=..., password: '...', api_key=..., client_secret=...
     [
-        /\b((?:access_|refresh_|id_|api_|auth_|session_)?token|password|passwd|pwd|secret|client_secret|api_?key)(["']?\s{0,8}[:=]\s{0,8}["']?)[^\s"'&,;}]{1,4096}/gi,
+        /\b((?:access_|refresh_|id_|api_|auth_|session_)?token|password|passwd|pwd|secret|client_secret|api_?key)(["']?\s{0,8}[:=]\s{0,8}["']?)[^\s"'&,;}]+/gi,
         '$1$2[REDACTED]',
     ],
 ];
 
+// scheme:// at the start of a run (never mid-run, so each run is tried once).
+const URL_SCHEME = /(?<![a-z0-9+.-])[a-z][a-z0-9+.-]{0,31}:\/\//gi;
+
+// scheme://user:password@host -> scheme://[REDACTED]@host. Done as a scan rather than a regex so
+// credentials of any length are caught: the authority ends at the first '/', whitespace or quote,
+// and any '@' inside it means userinfo is present.
+function redactUrlCredentials(text: string): string {
+    let out = '';
+    let last = 0;
+    for (const m of text.matchAll(URL_SCHEME)) {
+        const start = m.index! + m[0].length;
+        if (start < last) continue;
+        // Walk the authority once, remembering the last '@'. (Searching backwards from its end
+        // with lastIndexOf would scan the whole text whenever there's no '@'.)
+        let at = -1;
+        for (let i = start; i < text.length && !/[\s/'"]/.test(text[i]); i++) if (text[i] === '@') at = i;
+        if (at >= start) {
+            out += text.slice(last, start) + '[REDACTED]';
+            last = at;
+        }
+    }
+    return out + text.slice(last);
+}
+
 export function redactSecrets(text: string): string {
+    text = redactUrlCredentials(text);
     for (const [pattern, replacement] of SECRET_PATTERNS) text = text.replace(pattern, replacement);
     return text;
 }
@@ -331,10 +355,12 @@ export async function readConsole(args: z.infer<typeof readConsoleInput>) {
         text = await readConsoleViaPort(port, host || '127.0.0.1', dev.nativeId);
     }
     const max = args.maxChars ?? 50_000;
-    // Trim to the requested tail (plus a margin for escapes and for a secret straddling the
-    // cut) before the regex passes, so their cost is bounded by maxChars, not the full buffer.
+    text = text.replace(ANSI_ESCAPE, '');
     const truncated = text.length > max;
-    if (text.length > max + 4096) text = text.slice(-(max + 4096));
-    text = redactSecrets(text.replace(ANSI_ESCAPE, ''));
-    return { id: args.id, truncated, console: text.length > max ? text.slice(-max) : text };
+    if (!truncated) return { id: args.id, truncated, console: redactSecrets(text) };
+    // Redact from the start of the line the cut falls in, then take the tail. Cutting first could
+    // separate a secret from the keyword that identifies it; redaction is linear, so even one
+    // very long line is cheap.
+    const lineStart = text.lastIndexOf('\n', text.length - max) + 1;
+    return { id: args.id, truncated, console: redactSecrets(text.slice(lineStart)).slice(-max) };
 }
