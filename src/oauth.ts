@@ -704,6 +704,7 @@ export class OAuthService {
             code_challenge_methods_supported: ['S256'],
             token_endpoint_auth_methods_supported: ['none'],
             scopes_supported: SUPPORTED_SCOPES,
+            authorization_response_iss_parameter_supported: true,
         });
     }
 
@@ -724,6 +725,7 @@ export class OAuthService {
             code_challenge_methods_supported: ['S256'],
             token_endpoint_auth_methods_supported: ['none'],
             scopes_supported: SUPPORTED_SCOPES,
+            authorization_response_iss_parameter_supported: true,
             subject_types_supported: ['public'],
             id_token_signing_alg_values_supported: ['ES256'],
         });
@@ -859,11 +861,15 @@ export class OAuthService {
         }
         // From here on we have a trusted redirect target; OAuth errors travel back via that
         // URI rather than displayed inline. Spec-compliant.
+        // RFC 9207: name the issuer in every authorization response, so a client talking to
+        // more than one AS can tell which one answered (mix-up attacks).
+        const issuer = this.endpoints(req).issuer;
         const redirectError = (error: string, description: string) => {
             const u = new URL(redirectUri);
             u.searchParams.set('error', error);
             u.searchParams.set('error_description', description);
             if (state) u.searchParams.set('state', state);
+            u.searchParams.set('iss', issuer);
             sendRedirect(res, u.toString());
         };
         if (responseType !== 'code') {
@@ -921,6 +927,7 @@ export class OAuthService {
         const target = new URL(redirectUri);
         target.searchParams.set('code', code);
         if (state) target.searchParams.set('state', state);
+        target.searchParams.set('iss', issuer);
         sendRedirect(res, target.toString());
     }
 
