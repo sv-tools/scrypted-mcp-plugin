@@ -257,19 +257,21 @@ const ANSI_ESCAPE = /\x1b\[[0-9;]*[A-Za-z]/g;
 // Consoles can carry credentials (camera URLs with user:pass, auth headers, tokens in query
 // strings or logged objects). Tool output ends up in the model's context, so redact the common
 // shapes before returning, the same reasoning as get_server_info's env filtering.
+// Every quantifier is bounded so the scan stays linear on long runs of token-like text
+// (base64 blobs, hex dumps); readConsole also trims to the requested tail before redacting.
 const SECRET_PATTERNS: Array<[RegExp, string]> = [
     // rtsp(s)://host/<path>: stream paths often are the credential (UniFi Protect's
     // rtsps://host:7441/<token>), so keep the host for debugging and drop the path.
-    [/\b(rtsps?:\/\/[^\s/'"]+\/)[^\s'"]+/gi, '$1[REDACTED]'],
+    [/\b(rtsps?:\/\/[^\s/'"]{1,255}\/)[^\s'"]{1,2048}/gi, '$1[REDACTED]'],
     // scheme://user:password@host -> scheme://[REDACTED]@host
-    [/\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]+@/gi, '$1[REDACTED]@'],
+    [/(?<![a-z0-9+.-])([a-z][a-z0-9+.-]{0,31}:\/\/)[^\s/@:]{1,256}:[^\s/@]{1,256}@/gi, '$1[REDACTED]@'],
     // Authorization: Bearer xyz / Basic xyz
-    [/\b(authorization\s*[:=]\s*["']?)(?:bearer|basic|digest)?\s*[^\s"',]+/gi, '$1[REDACTED]'],
+    [/\b(authorization\s{0,8}[:=]\s{0,8}["']?)(?:bearer|basic|digest)?\s{0,8}[^\s"',]{1,4096}/gi, '$1[REDACTED]'],
     // bare bearer tokens
-    [/\b(bearer\s+)[a-z0-9._~+/-]+=*/gi, '$1[REDACTED]'],
+    [/\b(bearer\s{1,8})[a-z0-9._~+/-]{1,4096}={0,2}/gi, '$1[REDACTED]'],
     // token=..., password: '...', api_key=..., client_secret=...
     [
-        /\b((?:access_|refresh_|id_|api_|auth_|session_)?token|password|passwd|pwd|secret|client_secret|api_?key)(["']?\s*[:=]\s*["']?)[^\s"'&,;}]+/gi,
+        /\b((?:access_|refresh_|id_|api_|auth_|session_)?token|password|passwd|pwd|secret|client_secret|api_?key)(["']?\s{0,8}[:=]\s{0,8}["']?)[^\s"'&,;}]{1,4096}/gi,
         '$1$2[REDACTED]',
     ],
 ];
@@ -328,8 +330,11 @@ export async function readConsole(args: z.infer<typeof readConsoleInput>) {
         const [port, host] = await plugins.getRemoteServicePort(dev.pluginId, 'console');
         text = await readConsoleViaPort(port, host || '127.0.0.1', dev.nativeId);
     }
-    text = redactSecrets(text.replace(ANSI_ESCAPE, ''));
     const max = args.maxChars ?? 50_000;
+    // Trim to the requested tail (plus a margin for escapes and for a secret straddling the
+    // cut) before the regex passes, so their cost is bounded by maxChars, not the full buffer.
     const truncated = text.length > max;
-    return { id: args.id, truncated, console: truncated ? text.slice(-max) : text };
+    if (text.length > max + 4096) text = text.slice(-(max + 4096));
+    text = redactSecrets(text.replace(ANSI_ESCAPE, ''));
+    return { id: args.id, truncated, console: text.length > max ? text.slice(-max) : text };
 }
