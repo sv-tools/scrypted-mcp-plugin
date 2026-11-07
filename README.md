@@ -59,6 +59,7 @@ log into Scrypted first" hint page. Sign in to Scrypted in another tab, then ret
 - `get_storage` / `set_storage` — Read / replace a plugin device's persistent KV storage.
 - `get_id_for_native_id` — Reverse-lookup a Scrypted device id from a plugin's internal `nativeId`.
 - `disconnect_clients` — Disconnect all websocket clients of a plugin (forces reconnection).
+- `read_console` — Read a device's console output, including its mixins.
 - `clear_console` — Clear a plugin device's console buffer.
 
 ### Devices

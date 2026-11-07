@@ -57,6 +57,8 @@ import {
 import {
     clearConsole,
     clearConsoleInput,
+    readConsole,
+    readConsoleInput,
     disconnectClients,
     disconnectClientsInput,
     getIdForNativeId,
@@ -141,7 +143,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
                 'This MCP server runs inside a Scrypted plugin and controls the same Scrypted server (https://scrypted.app).',
                 'Inspect: list_plugins / get_plugin_info / get_logs / get_server_info / npm_info.',
                 'Devices: list_devices / get_device / call_device_method (any RPC method); resolve nativeIds with get_id_for_native_id.',
-                'Plugin lifecycle: reload_plugin (after code changes), install_plugin, update_plugins, kill_plugin, disconnect_clients, clear_console.',
+                'Plugin lifecycle: reload_plugin (after code changes), install_plugin, update_plugins, kill_plugin, disconnect_clients, read_console, clear_console.',
                 'Device config: get_storage / set_storage (KV storage), set_mixins, rename_device_id.',
                 'Server admin: restart_server, update_server, get_dotenv / set_dotenv, list_users / add_user / remove_user.',
                 'Network: get_local_addresses / set_local_addresses, get_external_addresses / set_external_addresses, get_cors / set_cors.',
@@ -361,6 +363,21 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
             },
         },
         wrap(disconnectClients),
+    );
+
+    server.registerTool(
+        'read_console',
+        {
+            description:
+                "Read a device's console (the same output as its Console tab in the Scrypted UI), newest at the end. Includes output from the device's mixins, e.g. HomeKit. Use maxChars to limit the tail.",
+            inputSchema: readConsoleInput.shape,
+            annotations: {
+                title: 'Read device console',
+                readOnlyHint: true,
+                openWorldHint: false,
+            },
+        },
+        wrap(readConsole),
     );
 
     server.registerTool(
