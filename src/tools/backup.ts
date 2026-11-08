@@ -1,6 +1,12 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
-import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import {
+    acceptedContent,
+    inputRequired,
+    inputResponse,
+    type RequestStateCodec,
+    type ServerContext,
+} from '@modelcontextprotocol/server';
 import { getComponent, isExpectedDisconnectError } from '../scrypted';
 
 interface BackupComponent {
@@ -111,77 +117,100 @@ export const restoreBackupInput = z.object({
         ),
 });
 
-// `restoreBackup` needs the live McpServer to issue an elicitation request mid-call. The
-// `getMaxBytes` getter reads the configurable size cap from plugin settings on each call so
-// a Settings change applies on the next invocation without a reload. Returned as a factory
-// so the closure captures the server + getter without leaking them as globals.
-export function makeRestoreBackupHandler(server: McpServer, getMaxBytes: () => number) {
-    return async function restoreBackup(args: z.infer<typeof restoreBackupInput>) {
-        if (args.confirm !== RESTORE_TRIPWIRE)
-            throw new Error(
-                `confirm must equal "${RESTORE_TRIPWIRE}" verbatim. The agent must surface this confirmation to the user before calling restore_backup.`,
-            );
+// What restore_backup carries between its two rounds. Sealed by the request-state codec
+// (HMAC, bound to the method and OAuth client, short TTL), so on the confirming round it proves
+// this server asked about exactly this payload.
+export type RestoreState = { step: 'awaiting-confirm'; sha256: string; bytes: number };
 
-        // Decode in memory; never staged to disk. The bytes came from the client to begin
-        // with, so a re-upload on retry is cheap, and skipping tmp avoids accumulating
-        // multi-MB ZIPs across failed or cancelled restore attempts.
-        const maxBytes = Math.max(MIN_MAX_RESTORE_BYTES, Math.floor(getMaxBytes()) || DEFAULT_MAX_RESTORE_BYTES);
-        const data = strictBase64Decode(args.backupBase64, maxBytes);
-        if (data.length === 0) throw new Error('backupBase64 decoded to zero bytes');
-        const sha256 = createHash('sha256').update(data).digest('hex');
+const RESTORE_CONFIRM_SCHEMA = z.object({ confirm: z.enum(['RESTORE', 'CANCEL']) });
 
-        // Elicitation is the real lock: the server pauses and asks the client to put a
-        // confirmation in front of the user. If the client doesn't advertise the elicitation
-        // capability we refuse to proceed — without elicitation we can't prove a human ever
-        // saw the prompt. Better to fail loud than restore behind the user's back.
-        const caps = server.server.getClientCapabilities();
-        if (!caps?.elicitation) {
-            throw new Error(
-                `restore_backup requires a client that supports MCP elicitation; this client did not advertise the capability. Re-invoke with an elicitation-capable client (decoded payload was ${data.length} bytes, sha256=${sha256}).`,
-            );
-        }
+function text(result: unknown) {
+    return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] };
+}
 
-        const elicitation = await server.server.elicitInput({
-            message: [
-                `About to restore Scrypted from a ${data.length}-byte ZIP (sha256=${sha256}).`,
-                'This will kill the running Scrypted server, wipe the existing database and all installed plugin files,',
-                'then extract the backup and restart. Plugins will be reinstalled from npm on first boot.',
-                'Choose RESTORE to proceed or CANCEL to abort.',
-            ].join(' '),
-            requestedSchema: {
-                type: 'object',
-                properties: {
-                    confirm: {
-                        type: 'string',
-                        title: 'Confirm restore',
-                        description: 'Choose RESTORE to proceed or CANCEL to abort.',
-                        enum: ['RESTORE', 'CANCEL'],
-                    },
-                },
-                required: ['confirm'],
-            },
-        });
-
-        if (elicitation.action !== 'accept') {
-            return { restored: false, reason: `user ${elicitation.action}ed` };
-        }
-        const elicitedConfirm = elicitation.content?.confirm;
-        if (elicitedConfirm !== 'RESTORE') {
-            return { restored: false, reason: `user did not confirm (got: ${String(elicitedConfirm)})` };
-        }
-
-        const backup = await getComponent<BackupComponent>('backup');
+// Two rounds. The first call validates the payload and returns an input request asking the
+// user to confirm, along with a sealed requestState. The client shows the prompt and retries
+// with the answer. A confirmation only counts when it arrives with that state: an "accept" the
+// client sends on its own, without the state, just gets the prompt again. `getMaxBytes` reads
+// the size cap from plugin settings on each call, so a Settings change applies immediately.
+export function makeRestoreBackupHandler(state: RequestStateCodec<RestoreState>, getMaxBytes: () => number) {
+    return async function restoreBackup(args: z.infer<typeof restoreBackupInput>, ctx: ServerContext) {
         try {
-            await backup.restore(data);
-        } catch (e) {
-            // Server-side restore() calls runtime.kill() then schedules a restart, so the
-            // RPC connection drops before the call resolves. Treat *that* disconnect as
-            // success — but real failures (corrupt ZIP rejected by the restore validator,
-            // permission errors, etc.) must propagate so we don't silently report a
-            // successful restore that never happened. The buffer is gone after this returns;
-            // a retry requires re-uploading the same base64.
-            if (!isExpectedDisconnectError(e)) throw e;
+            if (args.confirm !== RESTORE_TRIPWIRE)
+                throw new Error(
+                    `confirm must equal "${RESTORE_TRIPWIRE}" verbatim. The agent must surface this confirmation to the user before calling restore_backup.`,
+                );
+
+            // Decode in memory; never staged to disk. The bytes came from the client to begin
+            // with, so a re-upload on retry is cheap, and skipping tmp avoids accumulating
+            // multi-MB ZIPs across failed or cancelled restore attempts.
+            const maxBytes = Math.max(MIN_MAX_RESTORE_BYTES, Math.floor(getMaxBytes()) || DEFAULT_MAX_RESTORE_BYTES);
+            const data = strictBase64Decode(args.backupBase64, maxBytes);
+            if (data.length === 0) throw new Error('backupBase64 decoded to zero bytes');
+            const sha256 = createHash('sha256').update(data).digest('hex');
+
+            // Verified by ServerOptions.requestState.verify before we get here, so a present
+            // state was minted by this server, for this client, within the TTL.
+            const pending = ctx.mcpReq.requestState<RestoreState>();
+            if (pending?.step !== 'awaiting-confirm') {
+                return inputRequired({
+                    inputRequests: {
+                        confirm: inputRequired.elicit({
+                            message: [
+                                `About to restore Scrypted from a ${data.length}-byte ZIP (sha256=${sha256}).`,
+                                'This will kill the running Scrypted server, wipe the existing database and all installed plugin files,',
+                                'then extract the backup and restart. Plugins will be reinstalled from npm on first boot.',
+                                'Choose RESTORE to proceed or CANCEL to abort.',
+                            ].join(' '),
+                            requestedSchema: {
+                                type: 'object',
+                                properties: {
+                                    confirm: {
+                                        type: 'string',
+                                        title: 'Confirm restore',
+                                        description: 'Choose RESTORE to proceed or CANCEL to abort.',
+                                        enum: ['RESTORE', 'CANCEL'],
+                                    },
+                                },
+                                required: ['confirm'],
+                            },
+                        }),
+                    },
+                    requestState: await state.mint({ step: 'awaiting-confirm', sha256, bytes: data.length }, ctx),
+                });
+            }
+
+            // The confirmation covers one specific payload. A different blob on the retry means
+            // the user never saw a prompt for it.
+            if (pending.sha256 !== sha256)
+                return text({ restored: false, reason: 'backup changed after the confirmation prompt; start again' });
+
+            const answer = inputResponse(ctx.mcpReq.inputResponses, 'confirm');
+            if (answer.kind !== 'elicit') return text({ restored: false, reason: 'no confirmation received' });
+            if (answer.action !== 'accept')
+                return text({
+                    restored: false,
+                    reason: answer.action === 'decline' ? 'user declined' : 'user cancelled',
+                });
+            const confirmed = acceptedContent(ctx.mcpReq.inputResponses, 'confirm', RESTORE_CONFIRM_SCHEMA);
+            if (confirmed?.confirm !== 'RESTORE')
+                return text({ restored: false, reason: `user did not confirm (got: ${String(confirmed?.confirm)})` });
+
+            const backup = await getComponent<BackupComponent>('backup');
+            try {
+                await backup.restore(data);
+            } catch (e) {
+                // Server-side restore() calls runtime.kill() then schedules a restart, so the
+                // RPC connection drops before the call resolves. Treat *that* disconnect as
+                // success — but real failures (corrupt ZIP rejected by the restore validator,
+                // permission errors, etc.) must propagate so we don't silently report a
+                // successful restore that never happened. The buffer is gone after this returns;
+                // a retry requires re-uploading the same base64.
+                if (!isExpectedDisconnectError(e)) throw e;
+            }
+            return text({ restored: true, bytes: data.length, sha256 });
+        } catch (e: any) {
+            return { isError: true, content: [{ type: 'text' as const, text: `error: ${e?.message ?? String(e)}` }] };
         }
-        return { restored: true, bytes: data.length, sha256 };
     };
 }

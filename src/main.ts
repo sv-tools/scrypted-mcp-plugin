@@ -1,6 +1,13 @@
-import { randomUUID } from 'node:crypto';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
+import { randomBytes } from 'node:crypto';
+import {
+    McpServer,
+    WebStandardStreamableHTTPServerTransport,
+    createMcpHandler,
+    createRequestStateCodec,
+    isLegacyRequest,
+    type AuthInfo as SdkAuthInfo,
+    type RequestStateCodec,
+} from '@modelcontextprotocol/server';
 import sdk, {
     ScryptedDeviceBase,
     ScryptedInterface,
@@ -30,7 +37,13 @@ import {
     removeAlert,
     removeAlertInput,
 } from './tools/alerts';
-import { createBackup, createBackupInput, makeRestoreBackupHandler, restoreBackupInput } from './tools/backup';
+import {
+    createBackup,
+    createBackupInput,
+    makeRestoreBackupHandler,
+    restoreBackupInput,
+    type RestoreState,
+} from './tools/backup';
 import { listClusterWorkers, listClusterWorkersInput } from './tools/cluster';
 import {
     callDeviceMethod,
@@ -128,17 +141,16 @@ function wrap<TArgs, TResult>(handler: (args: TArgs) => Promise<TResult>, opts: 
     };
 }
 
-// Construct a fresh McpServer with the full tool surface. We build one per Streamable HTTP
-// session because Server.connect(transport) binds a server to one transport, and each
-// session has its own transport instance. Session lifetime is short — until the client
-// closes the connection or sends DELETE — so the per-session allocation cost is fine.
+// Construct a fresh McpServer with the full tool surface. createMcpHandler calls this once
+// per request (it's stateless, for both protocol eras), so keep it cheap: registration only,
+// no I/O.
 //
 // `getMaxRestoreBytes` is plumbed through so tools that need access to plugin settings
 // (currently just restore_backup) can read the live value without coupling to the plugin
 // instance directly.
-function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
+function createMcpServer(getMaxRestoreBytes: () => number, restoreState: RequestStateCodec<RestoreState>): McpServer {
     const server = new McpServer(
-        { name: 'scrypted-mcp', version: '1.2.0' },
+        { name: 'scrypted-mcp', version: '1.3.0' },
         {
             instructions: [
                 'This MCP server runs inside a Scrypted plugin and controls the same Scrypted server (https://scrypted.app).',
@@ -149,10 +161,21 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
                 'Server admin: restart_server, update_server, get_dotenv / set_dotenv, list_users / add_user / remove_user.',
                 'Network: get_local_addresses / set_local_addresses, get_external_addresses / set_external_addresses, get_cors / set_cors.',
                 'Alerts and cluster: list_alerts / remove_alert / clear_alerts, clear_logs, list_cluster_workers.',
-                'Backup: create_backup returns the ZIP inline as a base64 blob; restore_backup takes a base64 blob input and is destructive (triggers a user confirmation prompt).',
+                'Backup: create_backup returns the ZIP inline as a base64 blob; restore_backup takes a base64 blob input and is destructive (asks the user to confirm before it runs).',
                 'Tool annotations are set: prefer readOnly tools freely; destructive tools (set_*, clear_*, remove_*, kill_*, restart/update_server, restore_backup) should be surfaced to the user first.',
                 'Logs are retained ~48h; pass `sinceMs` to focus on a recent window.',
             ].join(' '),
+            // restore_backup asks for confirmation with a multi-round-trip input request, and
+            // the echoed requestState is the proof the server asked. Verify it before the
+            // handler runs. Older clients are served statelessly, where the shim can't carry
+            // the round trip, so fail those immediately instead of waiting out its timeout.
+            // The tool list is fixed for the life of the process. Without this, registerTool
+            // advertises listChanged: true, and every subscriptions/listen holds an SSE stream
+            // open through Scrypted's sendStream(), which leaks a cluster connection (#89).
+            // With it, listen is acknowledged with nothing subscribed and closes at once.
+            capabilities: { tools: { listChanged: false } },
+            requestState: { verify: restoreState.verify },
+            inputRequired: { legacyShim: false },
         },
     );
 
@@ -161,7 +184,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         {
             description:
                 'List installed Scrypted plugins. Returns for each: Scrypted device `id`, npm `pluginId` (the id passed to reload_plugin / get_plugin_info / kill_plugin), name, and type.',
-            inputSchema: listPluginsInput.shape,
+            inputSchema: listPluginsInput,
             annotations: {
                 title: 'List plugins',
                 readOnlyHint: true,
@@ -176,7 +199,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         'get_plugin_info',
         {
             description: 'Inspect a plugin: pid, pending RPC calls, object count, etc.',
-            inputSchema: getPluginInfoInput.shape,
+            inputSchema: getPluginInfoInput,
             annotations: {
                 title: 'Get plugin info',
                 readOnlyHint: true,
@@ -191,7 +214,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         'reload_plugin',
         {
             description: 'Restart a plugin host process (preserves state, picks up code changes).',
-            inputSchema: reloadPluginInput.shape,
+            inputSchema: reloadPluginInput,
             annotations: {
                 title: 'Reload plugin',
                 destructiveHint: false,
@@ -208,7 +231,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         {
             description:
                 'Kill a plugin host without auto-reload — the plugin stays down until you call reload_plugin or the server restarts. Prefer reload_plugin unless you specifically need it stopped.',
-            inputSchema: killPluginInput.shape,
+            inputSchema: killPluginInput,
             annotations: {
                 title: 'Kill plugin',
                 destructiveHint: true,
@@ -224,7 +247,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         'install_plugin',
         {
             description: 'Install (or upgrade) a plugin from npm. Returns the plugin device id.',
-            inputSchema: installPluginInput.shape,
+            inputSchema: installPluginInput,
             annotations: {
                 title: 'Install plugin',
                 destructiveHint: false,
@@ -240,7 +263,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         'update_plugins',
         {
             description: 'Check all installed plugins against npm and upgrade any that are outdated.',
-            inputSchema: updatePluginsInput.shape,
+            inputSchema: updatePluginsInput,
             annotations: {
                 title: 'Update plugins',
                 destructiveHint: false,
@@ -257,7 +280,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         {
             description:
                 'Query npmjs.org via the Scrypted server. Pass a package name (e.g. "scrypted-kasa") for full metadata, or "-/v1/search?text=keywords:scrypted-plugin" to discover available Scrypted plugins. Returns the raw npm registry response.',
-            inputSchema: npmInfoInput.shape,
+            inputSchema: npmInfoInput,
             annotations: {
                 title: 'Query npm registry',
                 readOnlyHint: true,
@@ -273,7 +296,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         {
             description:
                 'Rename a Scrypted device id. Briefly kills the owning plugin host while it rewrites references — expect a short offline window.',
-            inputSchema: renameDeviceIdInput.shape,
+            inputSchema: renameDeviceIdInput,
             annotations: {
                 title: 'Rename device id',
                 destructiveHint: true,
@@ -290,7 +313,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         {
             description:
                 "Replace the list of mixins on a device. The provided array fully replaces the device's current mixins — read get_device first if you only want to add or remove one. Mixin ids are device ids of plugins like prebuffer, snapshot, REST, etc.",
-            inputSchema: setMixinsInput.shape,
+            inputSchema: setMixinsInput,
             annotations: {
                 title: 'Set device mixins',
                 destructiveHint: true,
@@ -306,7 +329,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         'get_storage',
         {
             description: "Read a plugin device's persistent KV storage (string keys, string values).",
-            inputSchema: getStorageInput.shape,
+            inputSchema: getStorageInput,
             annotations: {
                 title: 'Get device storage',
                 readOnlyHint: true,
@@ -322,7 +345,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         {
             description:
                 "Replace a plugin device's persistent KV storage. The provided map fully replaces existing storage — read get_storage first if you only want to change one key.",
-            inputSchema: setStorageInput.shape,
+            inputSchema: setStorageInput,
             annotations: {
                 title: 'Set device storage',
                 destructiveHint: true,
@@ -339,7 +362,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         {
             description:
                 "Reverse-lookup a Scrypted device id from a plugin's internal nativeId. Useful when reading logs that reference nativeIds. Returns { id: null } if no match.",
-            inputSchema: getIdForNativeIdInput.shape,
+            inputSchema: getIdForNativeIdInput,
             annotations: {
                 title: 'Resolve nativeId to device id',
                 readOnlyHint: true,
@@ -354,7 +377,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         'disconnect_clients',
         {
             description: 'Disconnect all websocket clients of a plugin (forces reconnection).',
-            inputSchema: disconnectClientsInput.shape,
+            inputSchema: disconnectClientsInput,
             annotations: {
                 title: 'Disconnect plugin clients',
                 destructiveHint: false,
@@ -371,7 +394,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         {
             description:
                 "Read a device's console (the same output as its Console tab in the Scrypted UI), newest at the end. Includes output from the device's mixins, e.g. HomeKit. Credentials in URLs, auth headers and token/password values are redacted. Use maxChars to limit the tail.",
-            inputSchema: readConsoleInput.shape,
+            inputSchema: readConsoleInput,
             annotations: {
                 title: 'Read device console',
                 readOnlyHint: true,
@@ -385,7 +408,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         'clear_console',
         {
             description: "Clear a plugin device's console buffer. Useful for setting up a clean repro window.",
-            inputSchema: clearConsoleInput.shape,
+            inputSchema: clearConsoleInput,
             annotations: {
                 title: 'Clear device console',
                 destructiveHint: true,
@@ -402,7 +425,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         {
             description:
                 'Fetch retained server-side logs (newest first). Filter by component (substring match), level, sinceMs. Results are capped (`truncated: true` when more matched) — narrow the filters or raise `limit` to see the rest.',
-            inputSchema: getLogsInput.shape,
+            inputSchema: getLogsInput,
             annotations: {
                 title: 'Get logs',
                 readOnlyHint: true,
@@ -417,7 +440,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         'clear_logs',
         {
             description: 'Clear the server-side log buffer. Returns { cleared: true } on success.',
-            inputSchema: clearLogsInput.shape,
+            inputSchema: clearLogsInput,
             annotations: {
                 title: 'Clear logs',
                 destructiveHint: true,
@@ -434,7 +457,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         {
             description:
                 'List Scrypted alerts (newest first). Alerts are persisted notices like plugin crashes or warnings. Results are capped (`truncated: true` when more matched) — raise `limit` to see the rest.',
-            inputSchema: listAlertsInput.shape,
+            inputSchema: listAlertsInput,
             annotations: {
                 title: 'List alerts',
                 readOnlyHint: true,
@@ -449,7 +472,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         'remove_alert',
         {
             description: 'Remove a single alert by id (use the `id` field from list_alerts).',
-            inputSchema: removeAlertInput.shape,
+            inputSchema: removeAlertInput,
             annotations: {
                 title: 'Remove alert',
                 destructiveHint: true,
@@ -465,7 +488,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         'clear_alerts',
         {
             description: 'Remove all alerts. Returns { cleared: true } on success.',
-            inputSchema: clearAlertsInput.shape,
+            inputSchema: clearAlertsInput,
             annotations: {
                 title: 'Clear alerts',
                 destructiveHint: true,
@@ -481,7 +504,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         'list_devices',
         {
             description: 'List devices on the Scrypted server. Filter by interface, type, or name substring.',
-            inputSchema: listDevicesInput.shape,
+            inputSchema: listDevicesInput,
             annotations: {
                 title: 'List devices',
                 readOnlyHint: true,
@@ -497,7 +520,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         {
             description:
                 'Get a snapshot of every state property on a device. Returns the full state map, which can be large for cameras; the `interfaces` array tells you which methods call_device_method can invoke.',
-            inputSchema: getDeviceInput.shape,
+            inputSchema: getDeviceInput,
             annotations: {
                 title: 'Get device',
                 readOnlyHint: true,
@@ -513,7 +536,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         {
             description:
                 "Invoke a method on a device (e.g. turnOn, setBrightness, getSettings). The available methods follow from the device's `interfaces` — call get_device first if unsure. May read or mutate depending on the method. Returns the JSON-serialized result.",
-            inputSchema: callDeviceMethodInput.shape,
+            inputSchema: callDeviceMethodInput,
             annotations: {
                 title: 'Call device method',
             },
@@ -525,7 +548,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         'get_server_info',
         {
             description: 'Get Scrypted server version and SCRYPTED_* environment variables.',
-            inputSchema: getServerInfoInput.shape,
+            inputSchema: getServerInfoInput,
             annotations: {
                 title: 'Get server info',
                 readOnlyHint: true,
@@ -540,7 +563,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         'restart_server',
         {
             description: 'Restart the Scrypted server. The current MCP connection will drop and need to reconnect.',
-            inputSchema: restartServerInput.shape,
+            inputSchema: restartServerInput,
             annotations: {
                 title: 'Restart server',
                 destructiveHint: true,
@@ -557,7 +580,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         {
             description:
                 'Trigger a Scrypted server update. Honors SCRYPTED_WEBHOOK_UPDATE if set, otherwise writes .update and restarts. Returns immediately; the server restarts asynchronously and the MCP connection will drop, like restart_server.',
-            inputSchema: updateServerInput.shape,
+            inputSchema: updateServerInput,
             annotations: {
                 title: 'Update server',
                 destructiveHint: true,
@@ -574,7 +597,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         {
             description:
                 'Read the contents of the Scrypted .env file. Returns empty content if the file does not exist.',
-            inputSchema: getDotEnvInput.shape,
+            inputSchema: getDotEnvInput,
             annotations: {
                 title: 'Get .env',
                 readOnlyHint: true,
@@ -590,7 +613,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         {
             description:
                 'Overwrite the Scrypted .env file. The provided content is written verbatim — include all keys you want to keep.',
-            inputSchema: setDotEnvInput.shape,
+            inputSchema: setDotEnvInput,
             annotations: {
                 title: 'Set .env',
                 destructiveHint: true,
@@ -606,7 +629,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         'list_users',
         {
             description: 'List Scrypted user accounts (username + admin flag).',
-            inputSchema: listUsersInput.shape,
+            inputSchema: listUsersInput,
             annotations: {
                 title: 'List users',
                 readOnlyHint: true,
@@ -621,7 +644,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         'add_user',
         {
             description: 'Create a new Scrypted user. Omit aclId to create an admin.',
-            inputSchema: addUserInput.shape,
+            inputSchema: addUserInput,
             annotations: {
                 title: 'Add user',
                 destructiveHint: false,
@@ -637,7 +660,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         'remove_user',
         {
             description: 'Delete a Scrypted user by username.',
-            inputSchema: removeUserInput.shape,
+            inputSchema: removeUserInput,
             annotations: {
                 title: 'Remove user',
                 destructiveHint: true,
@@ -653,7 +676,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         'get_local_addresses',
         {
             description: 'Get the configured local addresses / interface names that Scrypted advertises.',
-            inputSchema: getLocalAddressesInput.shape,
+            inputSchema: getLocalAddressesInput,
             annotations: {
                 title: 'Get local addresses',
                 readOnlyHint: true,
@@ -668,7 +691,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         'set_local_addresses',
         {
             description: 'Replace the configured local addresses. Pass interface names ("en0") or IPs.',
-            inputSchema: setLocalAddressesInput.shape,
+            inputSchema: setLocalAddressesInput,
             annotations: {
                 title: 'Set local addresses',
                 destructiveHint: true,
@@ -684,7 +707,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         'get_external_addresses',
         {
             description: 'Get the configured external (publicly reachable) addresses for a plugin endpoint.',
-            inputSchema: getExternalAddressesInput.shape,
+            inputSchema: getExternalAddressesInput,
             annotations: {
                 title: 'Get external addresses',
                 readOnlyHint: true,
@@ -699,7 +722,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         'set_external_addresses',
         {
             description: 'Replace the configured external addresses for a plugin endpoint.',
-            inputSchema: setExternalAddressesInput.shape,
+            inputSchema: setExternalAddressesInput,
             annotations: {
                 title: 'Set external addresses',
                 destructiveHint: true,
@@ -715,7 +738,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         'get_cors',
         {
             description: 'Get the CORS origin allowlist for a plugin endpoint.',
-            inputSchema: getCorsInput.shape,
+            inputSchema: getCorsInput,
             annotations: {
                 title: 'Get CORS allowlist',
                 readOnlyHint: true,
@@ -730,7 +753,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         'set_cors',
         {
             description: 'Replace the CORS origin allowlist for a plugin endpoint.',
-            inputSchema: setCorsInput.shape,
+            inputSchema: setCorsInput,
             annotations: {
                 title: 'Set CORS allowlist',
                 destructiveHint: true,
@@ -746,7 +769,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         'list_cluster_workers',
         {
             description: 'List registered Scrypted cluster worker nodes (id, name, labels, mode, address, fork count).',
-            inputSchema: listClusterWorkersInput.shape,
+            inputSchema: listClusterWorkersInput,
             annotations: {
                 title: 'List cluster workers',
                 readOnlyHint: true,
@@ -762,7 +785,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
         {
             description:
                 'Snapshot the Scrypted database. Returns the ZIP inline as a base64-encoded resource (plus a JSON summary with byte count + sha256) for the agent to save locally. Nothing is written to the Scrypted host filesystem.',
-            inputSchema: createBackupInput.shape,
+            inputSchema: createBackupInput,
             annotations: {
                 title: 'Create Scrypted backup',
                 destructiveHint: false,
@@ -784,10 +807,10 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
                 'Restore the Scrypted database from a base64-encoded backup ZIP. DESTRUCTIVE: kills the server, wipes the existing database',
                 'and installed plugin files, extracts the backup, then restarts. Plugins reinstall from npm on first boot.',
                 'Three gates: (1) the `confirm` argument must equal "RESTORE FROM BACKUP" verbatim, (2) the MCP client must',
-                'support elicitation and the user must accept the in-app confirmation prompt, (3) the agent must surface',
+                'support elicitation and the user must accept the confirmation it is asked to show, (3) the agent must surface',
                 'the size and impact to the user before invoking. The MCP connection will drop on success.',
             ].join(' '),
-            inputSchema: restoreBackupInput.shape,
+            inputSchema: restoreBackupInput,
             annotations: {
                 title: 'Restore Scrypted backup',
                 destructiveHint: true,
@@ -796,7 +819,7 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
                 openWorldHint: false,
             },
         },
-        wrap(makeRestoreBackupHandler(server, getMaxRestoreBytes)),
+        makeRestoreBackupHandler(restoreState, getMaxRestoreBytes),
     );
 
     return server;
@@ -805,18 +828,8 @@ function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
 // Plugin entrypoint. One process-wide instance, registered as the @scrypted/mcp plugin's
 // HttpRequestHandler. Owns:
 //   - the OAuth AS state (signing key, DCR registrations) — persisted in plugin storage
-//   - the live MCP session map keyed by Mcp-Session-Id
+//   - the MCP handler (stateless: a fresh McpServer per request, no session map)
 //   - inbound request dispatch to the right handler
-// Idle session reaper. The Streamable HTTP transport only fires onsessionclosed when the
-// client sends DELETE or its socket faults — clients that just stop calling leak entries
-// indefinitely. We stamp lastSeen on every request and sweep periodically. The TTL matches
-// the access-token lifetime: any session idle for that long either has an expired token (so
-// the next request would re-auth and create a fresh session anyway) or is genuinely
-// abandoned. The sweep interval is short enough to keep the map bounded in practice without
-// burning CPU.
-const SESSION_IDLE_TTL_MS = 60 * 60 * 1000; // 1h
-const SESSION_SWEEP_INTERVAL_MS = 10 * 60 * 1000; // 10min
-
 // Plugin settings. Persisted in plugin storage (so they survive reloads) under the keys
 // declared here; surfaced via getSettings() / putSetting() in the Scrypted UI.
 const STORAGE_KEY_DCR_MAX_CLIENTS = 'settings.dcr_max_clients';
@@ -825,6 +838,9 @@ const STORAGE_KEY_REFRESH_TOKEN_TTL_SEC = 'settings.refresh_token_ttl_sec';
 const STORAGE_KEY_MAX_RESTORE_MB = 'settings.max_restore_mb';
 // Settings key prefix for the per-token revoke buttons; the suffix is the token id.
 const API_TOKEN_REVOKE_KEY_PREFIX = 'api_token_revoke.';
+const STORAGE_KEY_REQUEST_STATE_KEY = 'mcp.request_state_key';
+// How long a restore_backup confirmation prompt stays answerable.
+const RESTORE_CONFIRM_TTL_SEC = 300;
 const DEFAULT_DCR_MAX_CLIENTS = 100;
 const DEFAULT_MAX_RESTORE_MB = 500;
 const MIN_MAX_RESTORE_MB = 1;
@@ -852,16 +868,12 @@ function readIntegerSetting(
     return n;
 }
 
-interface SessionEntry {
-    transport: WebStandardStreamableHTTPServerTransport;
-    server: McpServer;
-    lastSeen: number;
-}
-
 class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler, Settings {
     private oauth: OAuthService;
-    private sessions = new Map<string, SessionEntry>();
     private newApiToken?: { token: string; name: string; expiresAt: number };
+    private restoreState!: RequestStateCodec<RestoreState>;
+    private mcp!: ReturnType<typeof createMcpHandler>;
+    private makeServer!: () => McpServer;
 
     constructor(nativeId?: string) {
         super(nativeId);
@@ -876,7 +888,37 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
         this.console.log(
             '[scrypted-mcp] OAuth metadata at the same /public/.well-known/oauth-protected-resource path.',
         );
-        setInterval(() => this.sweepIdleSessions(), SESSION_SWEEP_INTERVAL_MS).unref();
+        this.buildMcpHandler();
+    }
+
+    // Both protocol eras are served statelessly from the same server factory: 2026-07-28
+    // requests through createMcpHandler, 2025-era requests through serveLegacy() below.
+    // Rebuilt when the requestState key rotates (revoke_all), so outstanding confirmations
+    // stop verifying.
+    private buildMcpHandler(): void {
+        this.restoreState = createRequestStateCodec<RestoreState>({
+            key: this.getRequestStateKey(),
+            ttlSeconds: RESTORE_CONFIRM_TTL_SEC,
+            // Bind to the method and the OAuth client, so a confirmation minted for one caller
+            // can't be replayed by another.
+            bind: ctx => `${ctx.mcpReq.method}\0${ctx.http?.authInfo?.clientId ?? ''}`,
+        });
+        this.makeServer = () => createMcpServer(() => this.getMaxRestoreBytes(), this.restoreState);
+        this.mcp = createMcpHandler(this.makeServer, {
+            legacy: 'reject',
+            onerror: e => this.console.error('[scrypted-mcp] MCP handler error:', e),
+        });
+    }
+
+    // HMAC key for restore_backup's confirmation round trip. Persisted so a plugin reload
+    // between the two rounds doesn't invalidate a pending confirmation.
+    private getRequestStateKey(): string {
+        let key = this.storage.getItem(STORAGE_KEY_REQUEST_STATE_KEY);
+        if (!key || key.length < 64) {
+            key = randomBytes(32).toString('hex');
+            this.storage.setItem(STORAGE_KEY_REQUEST_STATE_KEY, key);
+        }
+        return key;
     }
 
     private getDcrMaxClients(): number {
@@ -1023,15 +1065,6 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
                 value: this.getMaxRestoreMb(),
             },
             {
-                key: 'active_sessions',
-                title: 'Active MCP sessions',
-                description: 'In-memory MCP sessions currently held open. Idle sessions are reaped after 1h.',
-                type: 'integer',
-                group: 'Status',
-                readonly: true,
-                value: this.sessions.size,
-            },
-            {
                 key: 'registered_clients',
                 title: 'Registered DCR clients',
                 description: 'Persisted client registrations in plugin storage.',
@@ -1055,8 +1088,8 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
                 description: [
                     'DESTRUCTIVE. Drops every refresh token, deletes every DCR registration,',
                     'revokes every API token, rotates the JWT signing key (existing access tokens',
-                    'stop verifying), and closes all active MCP sessions. Every client will need',
-                    'to re-register and re-authenticate.',
+                    'stop verifying), and invalidates pending restore confirmations. Every client',
+                    'will need to re-register and re-authenticate.',
                 ].join(' '),
                 type: 'button',
                 group: 'Status',
@@ -1096,21 +1129,20 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
             this.oauth.apiTokens.revoke(key.slice(API_TOKEN_REVOKE_KEY_PREFIX.length));
         } else if (key === 'revoke_all') {
             const counts = await this.oauth.revokeAll();
-            const closed = this.closeAllSessions();
+            this.storage.removeItem(STORAGE_KEY_REQUEST_STATE_KEY);
+            this.buildMcpHandler();
             this.newApiToken = undefined;
             this.console.log(
-                '[scrypted-mcp] revoke_all: dropped %d clients + %d refresh tokens + %d API tokens, closed %d sessions, rotated signing key',
+                '[scrypted-mcp] revoke_all: dropped %d clients + %d refresh tokens + %d API tokens, rotated signing and request-state keys',
                 counts.clients,
                 counts.refreshTokens,
                 counts.apiTokens,
-                closed,
             );
         } else if (
             key === 'mcp_endpoint_https' ||
             key === 'mcp_endpoint_http' ||
             key === 'api_token_new' ||
             key === 'api_tokens' ||
-            key === 'active_sessions' ||
             key === 'registered_clients' ||
             key === 'active_refresh_tokens'
         ) {
@@ -1198,40 +1230,6 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
         this.storage.setItem(storageKey, String(Math.floor(n)));
     }
 
-    // Tear down every live MCP session. Used by the revoke_all button. The transports'
-    // onclose handlers also remove from the map; we delete inline as a backstop and to
-    // give an accurate count back to the caller.
-    private closeAllSessions(): number {
-        let closed = 0;
-        for (const [sid, entry] of this.sessions) {
-            try {
-                entry.transport.close();
-            } catch {
-                // closing an already-closed transport is fine
-            }
-            this.sessions.delete(sid);
-            closed++;
-        }
-        return closed;
-    }
-
-    private sweepIdleSessions(): void {
-        const now = Date.now();
-        for (const [sid, entry] of this.sessions) {
-            if (now - entry.lastSeen <= SESSION_IDLE_TTL_MS) continue;
-            // Best-effort transport teardown. The transport's onclose handler removes the
-            // entry from the map, but we delete here too in case close() is a no-op or
-            // throws — the goal is to bound the map regardless.
-            try {
-                entry.transport.close();
-            } catch {
-                // closing an already-closed transport is fine
-            }
-            this.sessions.delete(sid);
-            this.console.log('[scrypted-mcp] reaped idle session sid=%s idleMs=%d', sid, now - entry.lastSeen);
-        }
-    }
-
     async onRequest(req: HttpRequest, res: HttpResponse): Promise<void> {
         try {
             // OAuth surface routes itself off the /authorize, /token, /register, .well-known
@@ -1264,9 +1262,8 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
             // `streamableHttp.js:323` *does* extract the header, so we route the auth
             // bootstrap through there.
             //
-            // Returning 405 on GET costs us the optional standalone OOB notification
-            // stream, which we don't use anyway — elicitation flows over the per-request
-            // POST SSE stream, not the GET stream.
+            // Returning 405 on GET costs nothing: the handler below is stateless and answers
+            // GET with 405 too, since there is no standalone notification stream to open.
             if ((req.method ?? 'GET').toUpperCase() === 'GET') {
                 sendText(res, 405, 'Method Not Allowed');
                 return;
@@ -1275,18 +1272,6 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
             res.send(challenge.body, { code: challenge.status, headers: challenge.headers });
             return;
         }
-
-        // Streamable HTTP routes by Mcp-Session-Id. A request without one and without an
-        // initialize body is rejected by the transport itself (per spec), so we don't need to
-        // pre-validate here — we just look up an existing session or create a new transport
-        // and let the transport sort it out.
-        const sessionId = req.headers?.['mcp-session-id'];
-        let entry = sessionId ? this.sessions.get(sessionId) : undefined;
-        if (!entry) entry = await this.createSession();
-        // Stamp activity so the idle reaper doesn't evict an active session. Updates both
-        // the just-created and the looked-up entry — the latter is the load-bearing case
-        // (otherwise long-lived sessions would always be reaped at the TTL boundary).
-        entry.lastSeen = Date.now();
 
         const webReq = toWebRequest(req);
         // Scrypted parses the body as text — give it back as a parsed JSON object so the
@@ -1301,44 +1286,43 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
             }
         }
 
-        const webRes = await entry.transport.handleRequest(webReq, { parsedBody, authInfo });
+        if (await isLegacyRequest(webReq, parsedBody)) {
+            await this.serveLegacy(req, webReq, parsedBody, authInfo, res);
+            return;
+        }
+        // 2026-07-28: each request carries its protocol version and capabilities, and gets a
+        // fresh McpServer. Responses are plain JSON unless a tool emits a message first.
+        const webRes = await this.mcp.fetch(webReq, { parsedBody, authInfo });
         await fromWebResponse(webRes, res);
     }
 
-    private async createSession(): Promise<SessionEntry> {
-        // Forward-declare via a ref cell so the onsessioninitialized closure can capture
-        // the entry before we've built the transport. Today the SDK invokes that callback
-        // async after server.connect has committed the entry, so the original
-        // `const entry = ... after transport` ordering happened to work — but a future SDK
-        // change that invokes it synchronously inside the transport ctor would hit a TDZ
-        // ReferenceError. The .current cell sidesteps that: the closure captures the cell
-        // reference (always defined) and reads .current when invoked.
-        const entryRef: { current?: SessionEntry } = {};
+    // 2025-era clients: one stateless server per request, answering with plain JSON rather than
+    // an SSE stream. Every SSE response goes out through Scrypted's sendStream(), which leaks one
+    // cluster connection per response on current Scrypted servers (#89, koush/scrypted#2203).
+    // Nothing these clients use needs a mid-request stream; restore_backup's confirmation is
+    // only available on 2026-07-28. No sessions, so GET and DELETE have nothing to act on.
+    private async serveLegacy(
+        req: HttpRequest,
+        webReq: Request,
+        parsedBody: unknown,
+        authInfo: SdkAuthInfo,
+        res: HttpResponse,
+    ): Promise<void> {
+        if ((req.method ?? 'GET').toUpperCase() !== 'POST') {
+            sendText(res, 405, 'Method Not Allowed');
+            return;
+        }
         const transport = new WebStandardStreamableHTTPServerTransport({
-            sessionIdGenerator: () => randomUUID(),
-            onsessioninitialized: sid => {
-                // The transport calls this once it has assigned a session id — that's when we
-                // commit the entry to the map so subsequent requests can find it.
-                if (!entryRef.current) {
-                    this.console.error('[scrypted-mcp] onsessioninitialized fired before entry was built; sid=%s', sid);
-                    return;
-                }
-                this.sessions.set(sid, entryRef.current);
-            },
-            onsessionclosed: sid => {
-                this.sessions.delete(sid);
-            },
+            sessionIdGenerator: undefined,
+            enableJsonResponse: true,
         });
-        const server = createMcpServer(() => this.getMaxRestoreBytes());
-        const entry: SessionEntry = { transport, server, lastSeen: Date.now() };
-        entryRef.current = entry;
-        transport.onclose = () => {
-            // Belt-and-braces against the onsessionclosed callback: if the transport closes
-            // for a reason other than a DELETE (e.g. process error), drop the session anyway.
-            if (transport.sessionId) this.sessions.delete(transport.sessionId);
-        };
-        await server.connect(transport);
-        return entry;
+        const server = this.makeServer();
+        try {
+            await server.connect(transport);
+            await fromWebResponse(await transport.handleRequest(webReq, { parsedBody, authInfo }), res);
+        } finally {
+            await server.close().catch(() => {});
+        }
     }
 }
 
