@@ -406,16 +406,17 @@ class RefreshTokenStore {
 
 // --- Signing key -----------------------------------------------------------
 
-async function loadOrCreateSigningKey(storage: StorageLike): Promise<SigningKey> {
+async function loadOrCreateSigningKey(storage: StorageLike, console: ConsoleLike): Promise<SigningKey> {
     const raw = storage.getItem(STORAGE_KEY_SIGNING_JWK);
     if (raw) {
         try {
             const privateJwk = JSON.parse(raw) as JWK;
             return await importSigningKeyFromPrivateJwk(privateJwk);
-        } catch {
-            // Persisted key is corrupt — fall through and regenerate. Old tokens become
-            // unverifiable, which forces clients through the OAuth flow again. That's fine
-            // for a v1 — corrupt key is rare and re-auth is cheap.
+        } catch (e) {
+            // Persisted key is corrupt — fall through and regenerate. Old access tokens become
+            // unverifiable, so clients refresh or re-authenticate. Log it: a key that silently
+            // regenerates on every load looks exactly like a working one.
+            console.error('[oauth] persisted signing key could not be imported; generating a new one:', e);
         }
     }
     const key = await generateSigningKey(randomUUID());
@@ -466,7 +467,7 @@ export class OAuthService {
         this.clients = new ClientStore(opts.storage, opts.getMaxClients, opts.console);
         this.refreshTokens = new RefreshTokenStore(opts.storage, opts.console);
         this.apiTokens = new ApiTokenStore(opts.storage, opts.console);
-        this.signing = loadOrCreateSigningKey(opts.storage);
+        this.signing = loadOrCreateSigningKey(opts.storage, opts.console);
         this.getAccessTokenTtlSec = opts.getAccessTokenTtlSec;
         this.getRefreshTokenTtlSec = opts.getRefreshTokenTtlSec;
         // Fire-and-forget the periodic RT cleanup. unref() so the timer doesn't keep the
@@ -532,7 +533,7 @@ export class OAuthService {
         // ~59 minutes. Awaited so we surface key-generation errors here rather than at the
         // next inbound request.
         this.storage.removeItem(STORAGE_KEY_SIGNING_JWK);
-        this.signing = loadOrCreateSigningKey(this.storage);
+        this.signing = loadOrCreateSigningKey(this.storage, this.console);
         await this.signing;
         // In-memory auth codes are short-lived (60s) but a thorough revoke includes them.
         this.codes = new AuthCodeStore();
@@ -727,6 +728,7 @@ export class OAuthService {
             code_challenge_methods_supported: ['S256'],
             token_endpoint_auth_methods_supported: ['none'],
             scopes_supported: SUPPORTED_SCOPES,
+            authorization_response_iss_parameter_supported: true,
         });
     }
 
@@ -747,6 +749,7 @@ export class OAuthService {
             code_challenge_methods_supported: ['S256'],
             token_endpoint_auth_methods_supported: ['none'],
             scopes_supported: SUPPORTED_SCOPES,
+            authorization_response_iss_parameter_supported: true,
             subject_types_supported: ['public'],
             id_token_signing_alg_values_supported: ['ES256'],
         });
@@ -882,11 +885,15 @@ export class OAuthService {
         }
         // From here on we have a trusted redirect target; OAuth errors travel back via that
         // URI rather than displayed inline. Spec-compliant.
+        // RFC 9207: name the issuer in every authorization response, so a client talking to
+        // more than one AS can tell which one answered (mix-up attacks).
+        const ep = this.endpoints(req);
         const redirectError = (error: string, description: string) => {
             const u = new URL(redirectUri);
             u.searchParams.set('error', error);
             u.searchParams.set('error_description', description);
             if (state) u.searchParams.set('state', state);
+            u.searchParams.set('iss', ep.issuer);
             sendRedirect(res, u.toString());
         };
         if (responseType !== 'code') {
@@ -912,7 +919,6 @@ export class OAuthService {
         // anything else, fail loud with `invalid_target` instead of silently substituting
         // ours; otherwise the auth code's bound resource and the token's `aud` would
         // diverge in ways the client couldn't observe.
-        const ep = this.endpoints(req);
         if (resourceParam !== null && resourceParam !== ep.resource) {
             redirectError(
                 'invalid_target',
@@ -944,6 +950,7 @@ export class OAuthService {
         const target = new URL(redirectUri);
         target.searchParams.set('code', code);
         if (state) target.searchParams.set('state', state);
+        target.searchParams.set('iss', ep.issuer);
         sendRedirect(res, target.toString());
     }
 

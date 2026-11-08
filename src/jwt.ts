@@ -86,10 +86,12 @@ export async function importSigningKeyFromPrivateJwk(privateJwk: JWK): Promise<S
         true,
         ['sign'],
     );
-    // Strip the private scalar to derive the public JWK. WebCrypto won't import a private JWK
-    // with verify usage, so we make a separate import for the public half.
-    const { d: _d, ...publicHalf } = privateJwk;
-    const publicJwk: JWK = { ...publicHalf, alg: ALG, use: 'sig' };
+    // Derive the public JWK from the public fields only. Copying the rest of the stored private
+    // JWK would bring along its `key_ops: ["sign"]` (and `ext`), and WebCrypto rejects importing
+    // that with verify usage ("Key operations and usage mismatch"), so the persisted key could
+    // never be re-imported and a new one was generated on every load.
+    const { kty, crv, x, y, kid } = privateJwk;
+    const publicJwk: JWK = { kty, crv, x, y, kid, alg: ALG, use: 'sig' };
     const publicKey = await subtle.importKey(
         'jwk',
         publicJwk as webcrypto.JsonWebKey,
