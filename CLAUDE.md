@@ -27,7 +27,7 @@ The plugin is one process inside Scrypted. `src/main.ts` declares `ScryptedMcpPl
 
 `src/http-bridge.ts` is the only adapter between Scrypted's `HttpRequest`/`HttpResponse` and Web-standard `Request`/`Response`. Streamed responses (Content-Type: `text/event-stream`) flow through `HttpResponse.sendStream(AsyncGenerator<Buffer>)`; everything else buffers and `send`s.
 
-**Keep legacy on JSON.** On Scrypted ≤ 0.147.0, every `sendStream()` leaks one loopback cluster connection (#89, fixed upstream in koush/scrypted@ea52522, unreleased). Answering 2025-era clients with SSE leaked about one connection per call; JSON leaks none. The 2026-07-28 path uses SSE mainly for `subscriptions/listen`, one long-lived stream per client.
+**Keep legacy on JSON.** On Scrypted ≤ 0.147.0, every `sendStream()` leaks one loopback cluster connection (#89, fixed upstream in koush/scrypted@ea52522, unreleased). Answering 2025-era clients with SSE leaked about one connection per call; JSON leaks none. The 2026-07-28 path only uses SSE for `subscriptions/listen`, and since we advertise `tools.listChanged: false` it's acknowledged with nothing subscribed and closes immediately; don't flip that capability without a streaming story for #89.
 
 Two SSE behaviours are inherited from the SDK (`@modelcontextprotocol/server`) rather than implemented here, and both depend on the bridge staying byte- and header-transparent:
 

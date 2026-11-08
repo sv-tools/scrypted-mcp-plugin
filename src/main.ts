@@ -150,7 +150,7 @@ function wrap<TArgs, TResult>(handler: (args: TArgs) => Promise<TResult>, opts: 
 // instance directly.
 function createMcpServer(getMaxRestoreBytes: () => number, restoreState: RequestStateCodec<RestoreState>): McpServer {
     const server = new McpServer(
-        { name: 'scrypted-mcp', version: '1.2.0' },
+        { name: 'scrypted-mcp', version: '2.0.0' },
         {
             instructions: [
                 'This MCP server runs inside a Scrypted plugin and controls the same Scrypted server (https://scrypted.app).',
@@ -169,6 +169,11 @@ function createMcpServer(getMaxRestoreBytes: () => number, restoreState: Request
             // the echoed requestState is the proof the server asked. Verify it before the
             // handler runs. Older clients are served statelessly, where the shim can't carry
             // the round trip, so fail those immediately instead of waiting out its timeout.
+            // The tool list is fixed for the life of the process. Without this, registerTool
+            // advertises listChanged: true, and every subscriptions/listen holds an SSE stream
+            // open through Scrypted's sendStream(), which leaks a cluster connection (#89).
+            // With it, listen is acknowledged with nothing subscribed and closes at once.
+            capabilities: { tools: { listChanged: false } },
             requestState: { verify: restoreState.verify },
             inputRequired: { legacyShim: false },
         },
