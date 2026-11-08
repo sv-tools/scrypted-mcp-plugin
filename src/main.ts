@@ -18,7 +18,7 @@ import sdk, {
     type SettingValue,
     type Settings,
 } from '@scrypted/sdk';
-import { API_TOKEN_NAME_MAX_LEN, apiTokenIdFromLabel, apiTokenLabel } from './api-tokens';
+import { API_TOKEN_NAME_MAX_LEN, apiTokenSummary } from './api-tokens';
 import { fromWebResponse, sendJson, sendText, toWebRequest } from './http-bridge';
 import {
     ACCESS_TOKEN_TTL_MAX_SEC,
@@ -836,6 +836,8 @@ const STORAGE_KEY_DCR_MAX_CLIENTS = 'settings.dcr_max_clients';
 const STORAGE_KEY_ACCESS_TOKEN_TTL_SEC = 'settings.access_token_ttl_sec';
 const STORAGE_KEY_REFRESH_TOKEN_TTL_SEC = 'settings.refresh_token_ttl_sec';
 const STORAGE_KEY_MAX_RESTORE_MB = 'settings.max_restore_mb';
+// Settings key prefix for the per-token revoke buttons; the suffix is the token id.
+const API_TOKEN_REVOKE_KEY_PREFIX = 'api_token_revoke.';
 const STORAGE_KEY_REQUEST_STATE_KEY = 'mcp.request_state_key';
 // How long a restore_backup confirmation prompt stays answerable.
 const RESTORE_CONFIRM_TTL_SEC = 300;
@@ -1121,16 +1123,10 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
             if (!name) return;
             const { token, record } = this.oauth.apiTokens.create(name);
             this.newApiToken = { token, name: record.name, expiresAt: Date.now() + NEW_API_TOKEN_DISPLAY_MS };
-        } else if (key === 'api_tokens') {
-            // The multi-select round-trips the labels the operator kept; anything missing
-            // from the list is revoked. Revoked tokens fail verification on the next request,
-            // so clients using them stop working without an explicit close.
-            // A null/undefined value is not "remove everything": ignore it so a stray UI
-            // round-trip can't wipe every token. An explicit empty array does revoke all.
-            if (value === undefined || value === null) return;
-            const labels = Array.isArray(value) ? value : [value];
-            const keep = new Set(labels.map(l => apiTokenIdFromLabel(String(l))).filter((id): id is string => !!id));
-            this.oauth.apiTokens.retainOnly(keep);
+        } else if (key.startsWith(API_TOKEN_REVOKE_KEY_PREFIX)) {
+            // One button per token. Revoked tokens fail verification on the next request, so
+            // clients using them stop working without an explicit close.
+            this.oauth.apiTokens.revoke(key.slice(API_TOKEN_REVOKE_KEY_PREFIX.length));
         } else if (key === 'revoke_all') {
             const counts = await this.oauth.revokeAll();
             this.storage.removeItem(STORAGE_KEY_REQUEST_STATE_KEY);
@@ -1146,6 +1142,7 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
             key === 'mcp_endpoint_https' ||
             key === 'mcp_endpoint_http' ||
             key === 'api_token_new' ||
+            key === 'api_tokens' ||
             key === 'registered_clients' ||
             key === 'active_refresh_tokens'
         ) {
@@ -1160,8 +1157,9 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
     }
 
     // Settings rows for static API tokens: a name field that creates a token on save, the
-    // just-created plaintext (in-memory only, returned once), and a multi-select of existing
-    // tokens where removing an entry revokes it.
+    // just-created plaintext (in-memory only, returned once), and one row per existing token
+    // with a button that revokes it. (Earlier versions used a single multi-select, which the
+    // Scrypted UI lays out as chips on one line; `api_tokens` is still accepted as a no-op.)
     private getApiTokenSettings(endpointHttp: string): Setting[] {
         const settings: Setting[] = [
             {
@@ -1171,6 +1169,7 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
                     'Type a name for the client (e.g. "claude-code-laptop") and save to create a token.',
                     'API tokens skip OAuth, so they work over plain HTTP and with self-signed HTTPS,',
                     'where MCP clients refuse to run the OAuth flow. A token grants full admin access to every MCP tool.',
+                    `Names are limited to ${API_TOKEN_NAME_MAX_LEN} characters.`,
                 ].join(' '),
                 placeholder: 'Token name',
                 type: 'string',
@@ -1197,17 +1196,27 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
             // One-shot: the next getSettings() (refresh, reopen) no longer has it.
             this.newApiToken = undefined;
         }
-        const labels = this.oauth.apiTokens.list().map(apiTokenLabel);
-        settings.push({
-            key: 'api_tokens',
-            title: 'API tokens',
-            description: `Existing tokens. Remove an entry and save to revoke it. Names are limited to ${API_TOKEN_NAME_MAX_LEN} characters.`,
-            type: 'string',
-            group: 'API Tokens',
-            multiple: true,
-            choices: labels,
-            value: labels,
-        });
+        const tokens = this.oauth.apiTokens.list();
+        if (tokens.length === 0) {
+            settings.push({
+                key: 'api_tokens',
+                title: 'API tokens',
+                description: 'No API tokens yet.',
+                type: 'string',
+                group: 'API Tokens',
+                readonly: true,
+                value: 'none',
+            });
+        }
+        for (const record of tokens) {
+            settings.push({
+                key: API_TOKEN_REVOKE_KEY_PREFIX + record.id,
+                title: `Revoke "${record.name}"`,
+                description: `${apiTokenSummary(record)} Clients using it stop working immediately.`,
+                type: 'button',
+                group: 'API Tokens',
+            });
+        }
         return settings;
     }
 

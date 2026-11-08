@@ -64,7 +64,7 @@ The MCP `/mcp` path requires a Bearer JWT or API token in `Authorization`, not t
 `ScryptedMcpPlugin` implements `Settings`. The Settings tab is the only configuration surface — there is no env-var or file-based config. All values persist in plugin storage under `settings.*` keys and are read on every relevant request, so changes take effect immediately. Group → field mapping (see `getSettings()` in `src/main.ts`):
 
 - **Endpoint** (read-only): `mcp_endpoint_https`, `mcp_endpoint_http` — derived from `endpointManager.getLocalEndpoint`.
-- **API Tokens**: `api_token_create` (string; saving a non-empty name creates a token), `api_token_new` (read-only, one-shot in-memory plaintext of the last-created token), `api_tokens` (multi-select of `name [id] ...` labels; labels missing from the saved value are revoked).
+- **API Tokens**: `api_token_create` (string; saving a non-empty name creates a token), `api_token_new` (read-only, one-shot in-memory plaintext of the last-created token), one `api_token_revoke.<id>` button per token (click revokes it; `api_tokens` is the read-only "none" row when there are no tokens, and a no-op key otherwise).
 - **Configuration** (editable): `dcr_max_clients`, `access_token_ttl_sec`, `refresh_token_ttl_sec`, `max_restore_mb`. Bounds are enforced by `readIntegerSetting()` on read AND by `writeIntegerSetting()` on save, so a hand-edited storage value out of range silently falls back to the default.
 - **Status** (read-only + one button): `registered_clients`, `active_refresh_tokens`, plus the destructive `revoke_all` button. (There is no `active_sessions` count; the server is stateless.) Counts come from `OAuthService.getStats()` via the same DOM Storage iteration used by the LRU/sweep code.
 
