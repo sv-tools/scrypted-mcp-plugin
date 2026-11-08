@@ -50,7 +50,7 @@ rules out OAuth for the usual LAN setups: `http://<ip>:11080`, or `https://<ip>:
 certificate.
 
 For those, create a static **API token** in the plugin's Settings (*API Tokens → Create API token*: type a name and
-save). The token is shown once; copy it and send it as a Bearer header. The server never answers with a 401, so the
+save). Copy the token right away: it's shown only until you dismiss it, for at most 5 minutes. Send it as a Bearer header. The server never answers with a 401, so the
 client never starts OAuth:
 
 ```bash
@@ -158,9 +158,9 @@ reaching Scrypted.
 
 ### API Tokens
 
-- **Create API token** — type a client name and save to create a token. The plaintext is shown once, in a read-only
-  field with a ready-to-paste `claude mcp add` command; it's kept in memory only and disappears after 15 minutes or a
-  plugin reload.
+- **Create API token** — type a client name and save to create a token. The plaintext appears in a read-only field
+  with a ready-to-paste `claude mcp add` command. It's kept in memory only, never stored, and stays visible until you
+  press **Dismiss new token**, for at most 5 minutes; a plugin reload also hides it. Refreshing the page doesn't.
 - **API tokens** — the existing tokens with their creation and last-used dates. Remove an entry and save to revoke it.
 
 ### Configuration
