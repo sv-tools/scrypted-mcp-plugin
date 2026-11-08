@@ -30,8 +30,7 @@ export function toWebRequest(req: HttpRequest): Request {
 // generator (via RPC). We must cancel the reader in that case, not just release the lock:
 // cancel() is what fires the transport's ReadableStream `cancel` callback, which drops the
 // stream from its mapping and clears its keep-alive timer. Without it the abandoned stream
-// lingers until the session is reaped, and a reconnecting client's standalone GET stream
-// gets 409 "Only one SSE stream is allowed per session" in the meantime.
+// lingers with its keep-alive timer running until the per-request server is closed.
 async function* readableStreamToBufferGenerator(stream: ReadableStream<Uint8Array>): AsyncGenerator<Buffer, void> {
     const reader = stream.getReader();
     let finished = false;

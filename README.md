@@ -147,9 +147,9 @@ as potentially destructive. The full list is in the [tool reference](#tool-refer
 `restore_backup` is gated three ways before it runs:
 
 1. The `confirm` argument must equal the exact string `RESTORE FROM BACKUP`.
-2. The MCP client must support [elicitation](https://modelcontextprotocol.io/specification/server/elicitation) and the
-   user must explicitly select `RESTORE` in the confirmation dialog. Without elicitation support the tool refuses to
-   run.
+2. The MCP client must support [elicitation](https://modelcontextprotocol.io/specification/server/elicitation) on the
+   2026-07-28 protocol, and the user must explicitly select `RESTORE` in the confirmation dialog. Older (2025-era)
+   clients, and clients without elicitation, get a refusal instead. The confirmation expires after 5 minutes.
 3. The tool is annotated `destructiveHint: true` so well-behaved clients require user approval before the call.
 
 The MCP connection drops when the server restarts at the end of a successful restore.
@@ -207,12 +207,11 @@ required.
 
 Read-only health fields, refreshed each time the Settings tab is opened.
 
-- **Active MCP sessions** — In-memory sessions currently held open. Idle sessions are reaped after 1 h.
 - **Registered DCR clients** — Persisted client registrations in plugin storage.
 - **Persisted refresh tokens** — Refresh tokens currently in plugin storage.
 - **Revoke all tokens & disconnect clients** — DESTRUCTIVE button. Drops every refresh token, deletes every DCR
-  registration, revokes every API token, rotates the JWT signing key (existing access tokens immediately stop verifying), and closes all active
-  MCP sessions. Every client will need to re-register and re-authenticate. Use it if you suspect a token leak or want to
+  registration, revokes every API token, rotates the JWT signing key (existing access tokens immediately stop verifying),
+  and cancels any pending `restore_backup` confirmation. Every client will need to re-register and re-authenticate. Use it if you suspect a token leak or want to
   force a clean slate.
 
 ## How it works
@@ -220,7 +219,8 @@ Read-only health fields, refreshed each time the Settings tab is opened.
 ### Endpoint
 
 The endpoint (`<your-scrypted-base-url>/endpoint/scrypted-mcp/public/mcp`) speaks
-[Streamable HTTP](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#streamable-http).
+[Streamable HTTP](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports#streamable-http)
+(MCP 2026-07-28, with 2025-era clients still supported).
 Use whichever base you use for the Scrypted UI — `https://host:10443` if you're on the secure port, or
 `http://host:11080` if you're on the insecure one. The plugin auto-detects the protocol from the inbound port (or trusts
 `x-forwarded-proto` if you have a reverse proxy in front), so OAuth metadata documents come back with URLs your client
