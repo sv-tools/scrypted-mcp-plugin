@@ -863,13 +863,13 @@ export class OAuthService {
         // URI rather than displayed inline. Spec-compliant.
         // RFC 9207: name the issuer in every authorization response, so a client talking to
         // more than one AS can tell which one answered (mix-up attacks).
-        const issuer = this.endpoints(req).issuer;
+        const ep = this.endpoints(req);
         const redirectError = (error: string, description: string) => {
             const u = new URL(redirectUri);
             u.searchParams.set('error', error);
             u.searchParams.set('error_description', description);
             if (state) u.searchParams.set('state', state);
-            u.searchParams.set('iss', issuer);
+            u.searchParams.set('iss', ep.issuer);
             sendRedirect(res, u.toString());
         };
         if (responseType !== 'code') {
@@ -895,7 +895,6 @@ export class OAuthService {
         // anything else, fail loud with `invalid_target` instead of silently substituting
         // ours; otherwise the auth code's bound resource and the token's `aud` would
         // diverge in ways the client couldn't observe.
-        const ep = this.endpoints(req);
         if (resourceParam !== null && resourceParam !== ep.resource) {
             redirectError(
                 'invalid_target',
@@ -927,7 +926,7 @@ export class OAuthService {
         const target = new URL(redirectUri);
         target.searchParams.set('code', code);
         if (state) target.searchParams.set('state', state);
-        target.searchParams.set('iss', issuer);
+        target.searchParams.set('iss', ep.issuer);
         sendRedirect(res, target.toString());
     }
 
