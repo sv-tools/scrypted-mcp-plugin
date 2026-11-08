@@ -3,7 +3,7 @@ import type { HttpRequest, HttpResponse } from '@scrypted/sdk';
 import { ApiTokenStore, isApiTokenFormat } from './api-tokens';
 import { sendHtml, sendJson, sendRedirect } from './http-bridge';
 
-// Mirror of @modelcontextprotocol/sdk/server/auth/types#AuthInfo. Inlined rather than imported
+// Mirror of the MCP SDK's AuthInfo type (@modelcontextprotocol/server). Inlined rather than imported
 // because the MCP SDK ships its types as ESM under typesVersions, and importing them from a
 // CommonJS file trips TypeScript's TS1541 (type-only-import-from-ESM-needs-resolution-mode)
 // guard. The MCP transport's HandleRequestOptions.authInfo is structurally typed, so a
@@ -500,8 +500,8 @@ export class OAuthService {
     // Hard revoke, surfaced via the plugin's "Revoke all tokens" Settings button. Drops
     // every persisted refresh token, deletes every DCR client registration, rotates the
     // JWT signing key (so previously-issued access tokens immediately stop verifying), and
-    // resets the in-memory auth-code store. Caller is responsible for closing live MCP
-    // sessions — this method only handles state owned by OAuthService.
+    // resets the in-memory auth-code store. This method only handles state owned by
+    // OAuthService; the caller rotates anything else (the MCP request-state key).
     //
     // After this, any active client will see 401s on its next request and have to re-run
     // DCR + PKCE from scratch.
