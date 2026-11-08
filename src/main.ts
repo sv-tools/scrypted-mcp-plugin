@@ -11,6 +11,7 @@ import sdk, {
     type SettingValue,
     type Settings,
 } from '@scrypted/sdk';
+import { API_TOKEN_NAME_MAX_LEN, apiTokenIdFromLabel, apiTokenLabel } from './api-tokens';
 import { fromWebResponse, sendJson, sendText, toWebRequest } from './http-bridge';
 import {
     ACCESS_TOKEN_TTL_MAX_SEC,
@@ -137,7 +138,7 @@ function wrap<TArgs, TResult>(handler: (args: TArgs) => Promise<TResult>, opts: 
 // instance directly.
 function createMcpServer(getMaxRestoreBytes: () => number): McpServer {
     const server = new McpServer(
-        { name: 'scrypted-mcp', version: '1.0.10' },
+        { name: 'scrypted-mcp', version: '1.2.0' },
         {
             instructions: [
                 'This MCP server runs inside a Scrypted plugin and controls the same Scrypted server (https://scrypted.app).',
@@ -826,6 +827,11 @@ const DEFAULT_DCR_MAX_CLIENTS = 100;
 const DEFAULT_MAX_RESTORE_MB = 500;
 const MIN_MAX_RESTORE_MB = 1;
 const MAX_MAX_RESTORE_MB = 10240; // 10GB ceiling
+// A freshly created API token's plaintext is shown exactly once: the first getSettings()
+// after creation returns it and drops it from memory. If the operator misses it, they create
+// another token (cheap) and revoke the unused one. The TTL only bounds how long the plaintext
+// sits in memory when Settings is never reopened after creation.
+const NEW_API_TOKEN_DISPLAY_MS = 5 * 60 * 1000;
 
 // Reads a positive-integer setting from plugin storage. Returns the default when the value
 // is missing, malformed, or out of range — settings should never be able to brick the
@@ -853,6 +859,7 @@ interface SessionEntry {
 class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler, Settings {
     private oauth: OAuthService;
     private sessions = new Map<string, SessionEntry>();
+    private newApiToken?: { token: string; name: string; expiresAt: number };
 
     constructor(nativeId?: string) {
         super(nativeId);
@@ -953,12 +960,13 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
                 key: 'mcp_endpoint_http',
                 title: 'MCP endpoint URL (HTTP)',
                 description:
-                    'The plain-HTTP URL. Useful for local-network clients and debugging where the self-signed HTTPS cert is awkward. Do not expose to the internet.',
+                    'The plain-HTTP URL. Useful for local-network clients and debugging where the self-signed HTTPS cert is awkward. MCP clients refuse OAuth over plain HTTP to non-localhost hosts, so use an API token (below) with this URL. Do not expose to the internet.',
                 type: 'string',
                 group: 'Endpoint',
                 readonly: true,
                 value: endpointHttp,
             },
+            ...this.getApiTokenSettings(endpointHttp),
             {
                 key: 'dcr_max_clients',
                 title: 'Maximum DCR client registrations',
@@ -1044,9 +1052,9 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
                 title: 'Revoke all tokens & disconnect clients',
                 description: [
                     'DESTRUCTIVE. Drops every refresh token, deletes every DCR registration,',
-                    'rotates the JWT signing key (existing access tokens stop verifying),',
-                    'and closes all active MCP sessions. Every client will need to re-register',
-                    'and re-authenticate.',
+                    'revokes every API token, rotates the JWT signing key (existing access tokens',
+                    'stop verifying), and closes all active MCP sessions. Every client will need',
+                    'to re-register and re-authenticate.',
                 ].join(' '),
                 type: 'button',
                 group: 'Status',
@@ -1075,18 +1083,36 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
             );
         } else if (key === 'max_restore_mb') {
             this.writeIntegerSetting(key, value, STORAGE_KEY_MAX_RESTORE_MB, MIN_MAX_RESTORE_MB, MAX_MAX_RESTORE_MB);
+        } else if (key === 'api_token_create') {
+            const name = typeof value === 'string' ? value.trim() : '';
+            if (!name) return;
+            const { token, record } = this.oauth.apiTokens.create(name);
+            this.newApiToken = { token, name: record.name, expiresAt: Date.now() + NEW_API_TOKEN_DISPLAY_MS };
+        } else if (key === 'api_tokens') {
+            // The multi-select round-trips the labels the operator kept; anything missing
+            // from the list is revoked. Revoked tokens fail verification on the next request,
+            // so open sessions using them stop working without an explicit close.
+            // A null/undefined value is not "remove everything": ignore it so a stray UI
+            // round-trip can't wipe every token. An explicit empty array does revoke all.
+            if (value === undefined || value === null) return;
+            const labels = Array.isArray(value) ? value : [value];
+            const keep = new Set(labels.map(l => apiTokenIdFromLabel(String(l))).filter((id): id is string => !!id));
+            this.oauth.apiTokens.retainOnly(keep);
         } else if (key === 'revoke_all') {
             const counts = await this.oauth.revokeAll();
             const closed = this.closeAllSessions();
+            this.newApiToken = undefined;
             this.console.log(
-                '[scrypted-mcp] revoke_all: dropped %d clients + %d refresh tokens, closed %d sessions, rotated signing key',
+                '[scrypted-mcp] revoke_all: dropped %d clients + %d refresh tokens + %d API tokens, closed %d sessions, rotated signing key',
                 counts.clients,
                 counts.refreshTokens,
+                counts.apiTokens,
                 closed,
             );
         } else if (
             key === 'mcp_endpoint_https' ||
             key === 'mcp_endpoint_http' ||
+            key === 'api_token_new' ||
             key === 'active_sessions' ||
             key === 'registered_clients' ||
             key === 'active_refresh_tokens'
@@ -1099,6 +1125,58 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
         // Tell Scrypted the device's settings changed so the UI re-fetches via getSettings().
         // For revoke_all this also surfaces the freshly-zeroed stats.
         await this.onDeviceEvent(ScryptedInterface.Settings, undefined);
+    }
+
+    // Settings rows for static API tokens: a name field that creates a token on save, the
+    // just-created plaintext (in-memory only, returned once), and a multi-select of existing
+    // tokens where removing an entry revokes it.
+    private getApiTokenSettings(endpointHttp: string): Setting[] {
+        const settings: Setting[] = [
+            {
+                key: 'api_token_create',
+                title: 'Create API token',
+                description: [
+                    'Type a name for the client (e.g. "claude-code-laptop") and save to create a token.',
+                    'API tokens skip OAuth, so they work over plain HTTP and with self-signed HTTPS,',
+                    'where MCP clients refuse to run the OAuth flow. A token grants full admin access to every MCP tool.',
+                ].join(' '),
+                placeholder: 'Token name',
+                type: 'string',
+                group: 'API Tokens',
+                value: '',
+            },
+        ];
+        if (this.newApiToken && Date.now() > this.newApiToken.expiresAt) this.newApiToken = undefined;
+        if (this.newApiToken) {
+            const url = endpointHttp.startsWith('http') ? endpointHttp : '<mcp-endpoint-url>';
+            settings.push({
+                key: 'api_token_new',
+                title: `New token: ${this.newApiToken.name}`,
+                description: [
+                    'Copy it now: it is shown only this once and never stored. Refreshing the page hides it;',
+                    'if you lose it, create a new token and revoke this one.',
+                    `Claude Code: claude mcp add --transport http scrypted ${url} --header "Authorization: Bearer ${this.newApiToken.token}"`,
+                ].join(' '),
+                type: 'string',
+                group: 'API Tokens',
+                readonly: true,
+                value: this.newApiToken.token,
+            });
+            // One-shot: the next getSettings() (refresh, reopen) no longer has it.
+            this.newApiToken = undefined;
+        }
+        const labels = this.oauth.apiTokens.list().map(apiTokenLabel);
+        settings.push({
+            key: 'api_tokens',
+            title: 'API tokens',
+            description: `Existing tokens. Remove an entry and save to revoke it. Names are limited to ${API_TOKEN_NAME_MAX_LEN} characters.`,
+            type: 'string',
+            group: 'API Tokens',
+            multiple: true,
+            choices: labels,
+            value: labels,
+        });
+        return settings;
     }
 
     // Validate + persist an integer setting. Centralised so every numeric setting gets the

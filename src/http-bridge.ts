@@ -25,15 +25,31 @@ export function toWebRequest(req: HttpRequest): Request {
 // Drain a Web ReadableStream<Uint8Array> as an AsyncGenerator<Buffer> for Scrypted's
 // sendStream(...). The MCP transport's SSE response keeps the stream open until the
 // per-request work finishes; on each yield Scrypted forwards the chunk to the client.
+//
+// When the client disconnects, Scrypted stops iterating and calls return() on this
+// generator (via RPC). We must cancel the reader in that case, not just release the lock:
+// cancel() is what fires the transport's ReadableStream `cancel` callback, which drops the
+// stream from its mapping and clears its keep-alive timer. Without it the abandoned stream
+// lingers until the session is reaped, and a reconnecting client's standalone GET stream
+// gets 409 "Only one SSE stream is allowed per session" in the meantime.
 async function* readableStreamToBufferGenerator(stream: ReadableStream<Uint8Array>): AsyncGenerator<Buffer, void> {
     const reader = stream.getReader();
+    let finished = false;
     try {
         while (true) {
             const { value, done } = await reader.read();
-            if (done) return;
+            if (done) {
+                finished = true;
+                return;
+            }
             if (value && value.byteLength > 0) yield Buffer.from(value.buffer, value.byteOffset, value.byteLength);
         }
     } finally {
+        if (!finished) {
+            // Fire-and-forget: cancel() resolves once the source's cancel callback runs,
+            // and we don't want a slow/throwing callback to block generator teardown.
+            reader.cancel().catch(() => {});
+        }
         try {
             reader.releaseLock();
         } catch {
