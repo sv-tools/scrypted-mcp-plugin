@@ -6,7 +6,8 @@ can read logs and alerts, check plugin and device state, manage plugins, and bac
 using your Scrypted account to sign in.
 
 - **Runs inside Scrypted.** It's a plugin, not a separate service: install it and there's nothing else to host.
-- **Uses your Scrypted login.** No API keys to copy around; access is limited to Scrypted admin users.
+- **Uses your Scrypted login.** Sign in with OAuth as a Scrypted admin, or use an API token on a LAN without trusted
+  HTTPS.
 - **Destructive actions are labelled.** Tools that change or delete things are marked so your assistant asks before
   using them, and restoring a backup needs explicit confirmation.
 
@@ -39,7 +40,18 @@ claude mcp add --transport http --scope user scrypted https://your-scrypted-host
 ```
 
 The first time Claude Code uses it, a browser window opens to sign in. Claude Code runs on your machine, so a Scrypted
-server that's only reachable on your home network works fine.
+server that's only reachable on your home network works fine, as long as the URL is HTTPS with a certificate your
+machine trusts.
+
+For plain HTTP or Scrypted's default self-signed certificate, OAuth won't run. Create an API token in **Settings → API
+Tokens** instead (skip step 3) and pass it as a header:
+
+```bash
+claude mcp add --transport http --scope user scrypted http://your-scrypted-host:11080/endpoint/scrypted-mcp/public/mcp \
+  --header "Authorization: Bearer smcp_..."
+```
+
+See [OAuth needs HTTPS](#oauth-needs-https-use-an-api-token-otherwise) for details.
 
 **Claude Desktop and claude.ai:** not supported yet. See [Other clients](#other-clients) below.
 
@@ -153,6 +165,9 @@ The MCP connection drops when the server restarts at the end of a successful res
 Any MCP client that supports Streamable HTTP and OAuth, and signs in through a loopback redirect
 (`http://localhost:<port>/...`, as native clients such as Claude Code do), can connect with the endpoint URL from step 2.
 
+A client that can send a custom `Authorization` header can also connect with an
+[API token](#oauth-needs-https-use-an-api-token-otherwise), without OAuth.
+
 ### Claude Desktop and claude.ai
 
 Not supported yet. These apps connect from Anthropic's cloud and sign in with the redirect URI
@@ -172,7 +187,14 @@ reaching Scrypted.
 
 - **MCP endpoint URL (HTTPS)** — for production clients and anything behind a reverse proxy.
 - **MCP endpoint URL (HTTP)** — for local-network clients and debugging where the self-signed HTTPS cert is awkward.
-  Don't expose to the internet.
+  Use it with an API token (OAuth won't run over plain HTTP). Don't expose to the internet.
+
+### API Tokens
+
+- **Create API token** — type a client name and save to create a token. The plaintext appears once, in a read-only
+  field with a ready-to-paste `claude mcp add` command. It's never stored, and refreshing the page hides it for good. If
+  you lose it, create a new token and revoke the old one.
+- **API tokens** — the existing tokens with their creation and last-used dates. Remove an entry and save to revoke it.
 
 ### Configuration
 
@@ -194,7 +216,7 @@ Read-only health fields, refreshed each time the Settings tab is opened.
 - **Registered DCR clients** — Persisted client registrations in plugin storage.
 - **Persisted refresh tokens** — Refresh tokens currently in plugin storage.
 - **Revoke all tokens & disconnect clients** — DESTRUCTIVE button. Drops every refresh token, deletes every DCR
-  registration, rotates the JWT signing key (existing access tokens immediately stop verifying), and closes all active
+  registration, revokes every API token, rotates the JWT signing key (existing access tokens immediately stop verifying), and closes all active
   MCP sessions. Every client will need to re-register and re-authenticate. Use it if you suspect a token leak or want to
   force a clean slate.
 
@@ -234,6 +256,27 @@ The plugin is its own OAuth 2.1 Authorization Server. It supports:
 The login step is just **your existing Scrypted session**. When the MCP client opens `/authorize` in your browser,
 Scrypted's auth pipeline checks the cookie and populates the username for us. Auto-approve happens immediately — no
 consent screen. Only Scrypted admin users are authorized.
+
+### OAuth needs HTTPS: use an API token otherwise
+
+MCP clients only run the OAuth token exchange over HTTPS with a trusted certificate, or over plain HTTP to `localhost`.
+Claude Code, for example, fails with `OAuth token requests MUST use TLS (localhost / 127.0.0.1 / ::1 are exempt)`. That
+rules out OAuth for the usual LAN setups: `http://<ip>:11080`, or `https://<ip>:10443` with Scrypted's self-signed
+certificate.
+
+For those, create a static **API token** in the plugin's Settings (*API Tokens → Create API token*: type a name and
+save). The token is shown only once; copy it right away and send it as a Bearer header. The server never answers with a 401, so the
+client never starts OAuth:
+
+```bash
+claude mcp add scrypted --scope=user --transport http \
+  http://<scrypted-ip>:11080/endpoint/scrypted-mcp/public/mcp \
+  --header "Authorization: Bearer smcp_..."
+```
+
+API tokens don't expire. Only their SHA-256 is stored. Revoke one by removing it from the *API tokens* list in
+Settings, or use *Revoke all tokens*. A token grants the same admin-level access as an OAuth session, and over plain
+HTTP it travels in cleartext, so keep the HTTP port off the internet.
 
 ## Troubleshooting
 
