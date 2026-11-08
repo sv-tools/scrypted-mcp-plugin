@@ -406,7 +406,7 @@ class RefreshTokenStore {
 
 // --- Signing key -----------------------------------------------------------
 
-async function loadOrCreateSigningKey(storage: StorageLike, console?: ConsoleLike): Promise<SigningKey> {
+async function loadOrCreateSigningKey(storage: StorageLike, console: ConsoleLike): Promise<SigningKey> {
     const raw = storage.getItem(STORAGE_KEY_SIGNING_JWK);
     if (raw) {
         try {
@@ -416,7 +416,7 @@ async function loadOrCreateSigningKey(storage: StorageLike, console?: ConsoleLik
             // Persisted key is corrupt — fall through and regenerate. Old access tokens become
             // unverifiable, so clients refresh or re-authenticate. Log it: a key that silently
             // regenerates on every load looks exactly like a working one.
-            console?.error('[oauth] persisted signing key could not be imported; generating a new one:', e);
+            console.error('[oauth] persisted signing key could not be imported; generating a new one:', e);
         }
     }
     const key = await generateSigningKey(randomUUID());
