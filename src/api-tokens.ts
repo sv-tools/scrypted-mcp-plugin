@@ -107,6 +107,17 @@ export class ApiTokenStore {
         return revoked;
     }
 
+    // Revokes one token by id. Returns the revoked record, or undefined if there was none.
+    revoke(id: string): ApiTokenRecord | undefined {
+        for (const { key, record } of this.entries()) {
+            if (record.id !== id) continue;
+            this.storage.removeItem(key);
+            this.console.log('[api-tokens] revoked token name=%s id=%s', record.name, record.id);
+            return record;
+        }
+        return undefined;
+    }
+
     revokeAll(): number {
         return this.retainOnly(new Set()).length;
     }
@@ -137,14 +148,9 @@ export class ApiTokenStore {
     }
 }
 
-// Label shown in the Settings multi-select. Must embed the id: putSetting gets the labels
-// back and we parse the id out to decide what to keep.
-export function apiTokenLabel(record: ApiTokenRecord): string {
+// One line describing a token in Settings: when it was created and last used.
+export function apiTokenSummary(record: ApiTokenRecord): string {
     const created = record.createdAt ? new Date(record.createdAt * 1000).toISOString().slice(0, 10) : '?';
     const used = record.lastUsedAt ? new Date(record.lastUsedAt * 1000).toISOString().slice(0, 10) : 'never';
-    return `${record.name} [${record.id}] created ${created}, last used ${used}`;
-}
-
-export function apiTokenIdFromLabel(label: string): string | undefined {
-    return /\[([0-9a-f]{8})\]/.exec(label)?.[1];
+    return `Token ${record.id}, created ${created}, last used ${used}.`;
 }

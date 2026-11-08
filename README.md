@@ -189,7 +189,7 @@ reaching Scrypted.
 - **Create API token** — type a client name and save to create a token. The plaintext appears once, in a read-only
   field with a ready-to-paste `claude mcp add` command. It's never stored, and refreshing the page hides it for good. If
   you lose it, create a new token and revoke the old one.
-- **API tokens** — the existing tokens with their creation and last-used dates. Remove an entry and save to revoke it.
+- **Revoke "<name>"** — one row per existing token, with its creation and last-used dates. Click the button to revoke that token.
 
 ### Configuration
 
