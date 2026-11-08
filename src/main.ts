@@ -810,10 +810,10 @@ const DEFAULT_DCR_MAX_CLIENTS = 100;
 const DEFAULT_MAX_RESTORE_MB = 500;
 const MIN_MAX_RESTORE_MB = 1;
 const MAX_MAX_RESTORE_MB = 10240; // 10GB ceiling
-// Upper bound on how long a freshly created API token's plaintext stays visible in Settings.
-// It lives only in memory (never persisted), so a plugin reload also hides it, and the
-// operator can hide it sooner with the Dismiss button. We don't hide it after the first
-// getSettings() because the UI may fetch settings more than once before it renders.
+// A freshly created API token's plaintext is shown exactly once: the first getSettings()
+// after creation returns it and drops it from memory. If the operator misses it, they create
+// another token (cheap) and revoke the unused one. The TTL only bounds how long the plaintext
+// sits in memory when Settings is never reopened after creation.
 const NEW_API_TOKEN_DISPLAY_MS = 5 * 60 * 1000;
 
 // Reads a positive-integer setting from plugin storage. Returns the default when the value
@@ -1071,8 +1071,6 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
             if (!name) return;
             const { token, record } = this.oauth.apiTokens.create(name);
             this.newApiToken = { token, name: record.name, expiresAt: Date.now() + NEW_API_TOKEN_DISPLAY_MS };
-        } else if (key === 'api_token_dismiss') {
-            this.newApiToken = undefined;
         } else if (key === 'api_tokens') {
             // The multi-select round-trips the labels the operator kept; anything missing
             // from the list is revoked. Revoked tokens fail verification on the next request,
@@ -1113,7 +1111,7 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
     }
 
     // Settings rows for static API tokens: a name field that creates a token on save, the
-    // just-created plaintext (in-memory only, until dismissed or 5 minutes), and a multi-select of existing
+    // just-created plaintext (in-memory only, returned once), and a multi-select of existing
     // tokens where removing an entry revokes it.
     private getApiTokenSettings(endpointHttp: string): Setting[] {
         const settings: Setting[] = [
@@ -1138,8 +1136,8 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
                 key: 'api_token_new',
                 title: `New token: ${this.newApiToken.name}`,
                 description: [
-                    'Copy it now: it is never stored, and it stays visible only until you press Dismiss,',
-                    'for at most 5 minutes (a plugin reload also hides it). It cannot be shown again.',
+                    'Copy it now: it is shown only this once and never stored. Refreshing the page hides it;',
+                    'if you lose it, create a new token and revoke this one.',
                     `Claude Code: claude mcp add --transport http scrypted ${url} --header "Authorization: Bearer ${this.newApiToken.token}"`,
                 ].join(' '),
                 type: 'string',
@@ -1147,13 +1145,8 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
                 readonly: true,
                 value: this.newApiToken.token,
             });
-            settings.push({
-                key: 'api_token_dismiss',
-                title: 'Dismiss new token',
-                description: 'Hide the token above now. Do this once you have copied it.',
-                type: 'button',
-                group: 'API Tokens',
-            });
+            // One-shot: the next getSettings() (refresh, reopen) no longer has it.
+            this.newApiToken = undefined;
         }
         const labels = this.oauth.apiTokens.list().map(apiTokenLabel);
         settings.push({
