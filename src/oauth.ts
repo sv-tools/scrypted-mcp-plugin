@@ -1,5 +1,6 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import type { HttpRequest, HttpResponse } from '@scrypted/sdk';
+import { ApiTokenStore, isApiTokenFormat } from './api-tokens';
 import { sendHtml, sendJson, sendRedirect } from './http-bridge';
 
 // Mirror of @modelcontextprotocol/sdk/server/auth/types#AuthInfo. Inlined rather than imported
@@ -451,6 +452,9 @@ export class OAuthService {
     private clients: ClientStore;
     private codes = new AuthCodeStore();
     private refreshTokens: RefreshTokenStore;
+    // Static API tokens (see api-tokens.ts). Owned here so verifyBearer and revokeAll cover
+    // both credential types; main.ts reaches in for Settings create/list/revoke.
+    readonly apiTokens: ApiTokenStore;
     private signing: Promise<SigningKey>;
     private console: ConsoleLike;
     private getAccessTokenTtlSec: () => number;
@@ -461,6 +465,7 @@ export class OAuthService {
         this.storage = opts.storage;
         this.clients = new ClientStore(opts.storage, opts.getMaxClients, opts.console);
         this.refreshTokens = new RefreshTokenStore(opts.storage, opts.console);
+        this.apiTokens = new ApiTokenStore(opts.storage, opts.console);
         this.signing = loadOrCreateSigningKey(opts.storage);
         this.getAccessTokenTtlSec = opts.getAccessTokenTtlSec;
         this.getRefreshTokenTtlSec = opts.getRefreshTokenTtlSec;
@@ -475,7 +480,7 @@ export class OAuthService {
 
     // Counts persisted OAuth records by prefix. Used by the Settings UI to show a
     // health snapshot without exposing the records themselves.
-    getStats(): { clients: number; refreshTokens: number } {
+    getStats(): { clients: number; refreshTokens: number; apiTokens: number } {
         let clients = 0;
         let refreshTokens = 0;
         try {
@@ -488,7 +493,7 @@ export class OAuthService {
         } catch (e) {
             this.console.error('[oauth] getStats iteration failed:', e);
         }
-        return { clients, refreshTokens };
+        return { clients, refreshTokens, apiTokens: this.apiTokens.count() };
     }
 
     // Hard revoke, surfaced via the plugin's "Revoke all tokens" Settings button. Drops
@@ -499,8 +504,8 @@ export class OAuthService {
     //
     // After this, any active client will see 401s on its next request and have to re-run
     // DCR + PKCE from scratch.
-    async revokeAll(): Promise<{ clients: number; refreshTokens: number }> {
-        const counts = { clients: 0, refreshTokens: 0 };
+    async revokeAll(): Promise<{ clients: number; refreshTokens: number; apiTokens: number }> {
+        const counts = { clients: 0, refreshTokens: 0, apiTokens: 0 };
         const keysToRemove: string[] = [];
         try {
             for (let i = 0; i < this.storage.length; i++) {
@@ -519,6 +524,7 @@ export class OAuthService {
             throw e;
         }
         for (const k of keysToRemove) this.storage.removeItem(k);
+        counts.apiTokens = this.apiTokens.revokeAll();
         // Rotate the signing key. Removing the persisted JWK and re-running
         // loadOrCreateSigningKey forces generation of a fresh EC P-256 pair, which means
         // every still-unexpired access token (1h TTL) suddenly fails JWS verification.
@@ -531,9 +537,10 @@ export class OAuthService {
         // In-memory auth codes are short-lived (60s) but a thorough revoke includes them.
         this.codes = new AuthCodeStore();
         this.console.log(
-            '[oauth] revokeAll: removed %d clients + %d refresh tokens, rotated signing key',
+            '[oauth] revokeAll: removed %d clients + %d refresh tokens + %d API tokens, rotated signing key',
             counts.clients,
             counts.refreshTokens,
+            counts.apiTokens,
         );
         return counts;
     }
@@ -647,6 +654,22 @@ export class OAuthService {
         }
         const token = m[1];
         const ep = this.endpoints(req);
+        // Static API tokens carry a fixed prefix that can never start a JWT (a JWT's first
+        // segment is base64url JSON, i.e. "eyJ..."), so the two paths can't be confused.
+        if (isApiTokenFormat(token)) {
+            const record = this.apiTokens.verify(token);
+            if (!record) {
+                this.console.error('[oauth] unknown or revoked API token');
+                return undefined;
+            }
+            return {
+                token,
+                clientId: `api-token:${record.id}`,
+                scopes: SUPPORTED_SCOPES,
+                resource: new URL(ep.resource),
+                extra: { sub: `api-token:${record.name}` },
+            };
+        }
         try {
             const key = await this.signing;
             const payload = await verifyJwt(key, token, { issuer: ep.issuer, audience: ep.resource });
