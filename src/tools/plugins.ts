@@ -1,5 +1,6 @@
 import net from 'node:net';
 import { z } from 'zod';
+import { redactSecrets } from '../redact';
 import { getComponent, systemManager } from '../scrypted';
 
 // npm package name of this plugin. Used to refuse get_storage / set_storage against any
@@ -34,7 +35,7 @@ interface PluginComponent {
     clearConsole(id: string): Promise<void>;
     // Added in Scrypted server 0.148 (unreleased as of 0.147.0). Older servers only expose the
     // console through getRemoteServicePort(pluginId, 'console').
-    readConsole(id: string): Promise<string>;
+    readConsole?(id: string): Promise<string>;
     getRemoteServicePort(pluginId: string, name: string, ...args: unknown[]): Promise<[number, string | undefined]>;
 }
 
@@ -254,56 +255,6 @@ export const readConsoleInput = z.object({
 // eslint-disable-next-line no-control-regex
 const ANSI_ESCAPE = /\x1b\[[0-9;]*[A-Za-z]/g;
 
-// Consoles can carry credentials (camera URLs with user:pass, auth headers, tokens in query
-// strings or logged objects). Tool output ends up in the model's context, so redact the common
-// shapes before returning, the same reasoning as get_server_info's env filtering.
-// Value runs after a fixed anchor (a keyword, or rtsp://host/) are unbounded: each match starts
-// at the anchor and a global replace resumes after it, so the scan is linear and a long secret
-// is redacted whole. The only bounded parts are those where a match could start at many places.
-const SECRET_PATTERNS: Array<[RegExp, string]> = [
-    // rtsp(s)://host/<path>: stream paths often are the credential (UniFi Protect's
-    // rtsps://host:7441/<token>), so keep the host for debugging and drop the path.
-    [/\b(rtsps?:\/\/[^\s/'"]{1,255}\/)[^\s'"]+/gi, '$1[REDACTED]'],
-    // Authorization: Bearer xyz / Basic xyz
-    [/\b(authorization\s{0,8}[:=]\s{0,8}["']?)(?:bearer|basic|digest)?\s{0,8}[^\s"',]+/gi, '$1[REDACTED]'],
-    // bare bearer tokens
-    [/\b(bearer\s{1,8})[a-z0-9._~+/-]+=*/gi, '$1[REDACTED]'],
-    // token=..., password: '...', api_key=..., client_secret=...
-    [
-        /\b((?:access_|refresh_|id_|api_|auth_|session_)?token|password|passwd|pwd|secret|client_secret|api_?key)(["']?\s{0,8}[:=]\s{0,8}["']?)[^\s"'&,;}]+/gi,
-        '$1$2[REDACTED]',
-    ],
-];
-
-// scheme:// at the start of a run (never mid-run, so each run is tried once).
-const URL_SCHEME = /(?<![a-z0-9+.-])[a-z][a-z0-9+.-]{0,31}:\/\//gi;
-
-// scheme://user:password@host -> scheme://[REDACTED]@host. Done as a scan rather than a regex so
-// credentials of any length are caught: the authority ends at the first '/', whitespace or quote,
-// and any '@' inside it means userinfo is present.
-function redactUrlCredentials(text: string): string {
-    let out = '';
-    let last = 0;
-    for (const m of text.matchAll(URL_SCHEME)) {
-        const start = m.index! + m[0].length;
-        if (start < last) continue;
-        // Walk the authority once, remembering the last '@'. (Searching backwards from its end
-        // with lastIndexOf would scan the whole text whenever there's no '@'.)
-        let at = -1;
-        for (let i = start; i < text.length && !/[\s/'"]/.test(text[i]); i++) if (text[i] === '@') at = i;
-        if (at >= start) {
-            out += text.slice(last, start) + '[REDACTED]';
-            last = at;
-        }
-    }
-    return out + text.slice(last);
-}
-
-export function redactSecrets(text: string): string {
-    text = redactUrlCredentials(text);
-    for (const [pattern, replacement] of SECRET_PATTERNS) text = text.replace(pattern, replacement);
-    return text;
-}
 const PORT_READ_IDLE_MS = 250;
 const PORT_READ_MAX_MS = 5000;
 const PORT_READ_MAX_BYTES = 8 * 1024 * 1024;
@@ -345,10 +296,11 @@ function readConsoleViaPort(port: number, host: string, nativeId: string | undef
 
 export async function readConsole(args: z.infer<typeof readConsoleInput>) {
     const plugins = await getComponent<PluginComponent>('plugins');
-    let text: string;
+    let text: string | undefined;
     try {
-        text = await plugins.readConsole(args.id);
-    } catch {
+        text = await plugins.readConsole?.(args.id);
+    } catch {}
+    if (text === undefined) {
         const dev = systemManager.getDeviceById(args.id) as { pluginId?: string; nativeId?: string } | undefined;
         if (!dev?.pluginId) throw new Error(`device ${args.id} not found`);
         const [port, host] = await plugins.getRemoteServicePort(dev.pluginId, 'console');
