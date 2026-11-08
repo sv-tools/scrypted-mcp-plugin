@@ -1,4 +1,6 @@
+import net from 'node:net';
 import { z } from 'zod';
+import { redactSecrets } from '../redact';
 import { getComponent, systemManager } from '../scrypted';
 
 // npm package name of this plugin. Used to refuse get_storage / set_storage against any
@@ -31,6 +33,10 @@ interface PluginComponent {
     getIdForNativeId(pluginId: string, nativeId: string | undefined): Promise<string | undefined>;
     disconnectClients(pluginId: string): Promise<void>;
     clearConsole(id: string): Promise<void>;
+    // Added in Scrypted server 0.148 (unreleased as of 0.147.0). Older servers only expose the
+    // console through getRemoteServicePort(pluginId, 'console').
+    readConsole?(id: string): Promise<string>;
+    getRemoteServicePort(pluginId: string, name: string, ...args: unknown[]): Promise<[number, string | undefined]>;
 }
 
 export const listPluginsInput = z.object({});
@@ -231,4 +237,82 @@ export async function clearConsole(args: z.infer<typeof clearConsoleInput>) {
     const plugins = await getComponent<PluginComponent>('plugins');
     await plugins.clearConsole(args.id);
     return { cleared: args.id };
+}
+
+export const readConsoleInput = z.object({
+    id: z
+        .string()
+        .describe('Scrypted device id whose console to read (the `id` field from list_devices or list_plugins).'),
+    maxChars: z
+        .number()
+        .int()
+        .positive()
+        .max(1_000_000)
+        .optional()
+        .describe('Return at most this many characters from the end of the console. Default 50000.'),
+});
+
+// eslint-disable-next-line no-control-regex
+const ANSI_ESCAPE = /\x1b\[[0-9;]*[A-Za-z]/g;
+
+const PORT_READ_IDLE_MS = 250;
+const PORT_READ_MAX_MS = 5000;
+const PORT_READ_MAX_BYTES = 8 * 1024 * 1024;
+
+// The console read port sends the device's buffered output as soon as it receives the
+// device's nativeId, then keeps streaming new lines. Collect until the output goes quiet.
+function readConsoleViaPort(port: number, host: string, nativeId: string | undefined): Promise<string> {
+    return new Promise((resolve, reject) => {
+        const chunks: Buffer[] = [];
+        let bytes = 0;
+        let idle: NodeJS.Timeout | undefined;
+        const socket = net.connect({ port, host });
+        const finish = () => {
+            clearTimeout(idle);
+            clearTimeout(cap);
+            socket.destroy();
+            resolve(Buffer.concat(chunks).toString());
+        };
+        const cap = setTimeout(finish, PORT_READ_MAX_MS);
+        socket.on('connect', () => {
+            // The server reads the first chunk as the filter; "undefined" selects the plugin console.
+            socket.write(`${nativeId}\n`);
+            idle = setTimeout(finish, PORT_READ_IDLE_MS * 4);
+        });
+        socket.on('data', (data: Buffer) => {
+            chunks.push(data);
+            bytes += data.length;
+            clearTimeout(idle);
+            if (bytes >= PORT_READ_MAX_BYTES) finish();
+            else idle = setTimeout(finish, PORT_READ_IDLE_MS);
+        });
+        socket.on('error', e => {
+            clearTimeout(idle);
+            clearTimeout(cap);
+            reject(e);
+        });
+    });
+}
+
+export async function readConsole(args: z.infer<typeof readConsoleInput>) {
+    const plugins = await getComponent<PluginComponent>('plugins');
+    let text: string | undefined;
+    try {
+        text = await plugins.readConsole?.(args.id);
+    } catch {}
+    if (text === undefined) {
+        const dev = systemManager.getDeviceById(args.id) as { pluginId?: string; nativeId?: string } | undefined;
+        if (!dev?.pluginId) throw new Error(`device ${args.id} not found`);
+        const [port, host] = await plugins.getRemoteServicePort(dev.pluginId, 'console');
+        text = await readConsoleViaPort(port, host || '127.0.0.1', dev.nativeId);
+    }
+    const max = args.maxChars ?? 50_000;
+    text = text.replace(ANSI_ESCAPE, '');
+    const truncated = text.length > max;
+    if (!truncated) return { id: args.id, truncated, console: redactSecrets(text) };
+    // Redact from the start of the line the cut falls in, then take the tail. Cutting first could
+    // separate a secret from the keyword that identifies it; redaction is linear, so even one
+    // very long line is cheap.
+    const lineStart = text.lastIndexOf('\n', text.length - max) + 1;
+    return { id: args.id, truncated, console: redactSecrets(text.slice(lineStart)).slice(-max) };
 }
