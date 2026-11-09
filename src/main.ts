@@ -112,6 +112,7 @@ import {
     updateServer,
     updateServerInput,
 } from './tools/server';
+import { getPluginStats, getPluginStatsInput } from './tools/stats';
 import { addUser, addUserInput, listUsers, listUsersInput, removeUser, removeUserInput } from './tools/users';
 
 // Wrapper around tool handlers. Two responsibilities:
@@ -154,7 +155,7 @@ function createMcpServer(getMaxRestoreBytes: () => number, restoreState: Request
         {
             instructions: [
                 'This MCP server runs inside a Scrypted plugin and controls the same Scrypted server (https://scrypted.app).',
-                'Inspect: list_plugins / get_plugin_info / get_logs / get_server_info / npm_info.',
+                'Inspect: list_plugins / get_plugin_info / get_plugin_stats (per-plugin CPU and memory, including child processes like ffmpeg) / get_logs / get_server_info / npm_info.',
                 'Devices: list_devices / get_device / call_device_method (any RPC method); resolve nativeIds with get_id_for_native_id.',
                 'Plugin lifecycle: reload_plugin (after code changes), install_plugin, update_plugins, kill_plugin, disconnect_clients, read_console, clear_console.',
                 'Device config: get_storage / set_storage (KV storage), set_mixins, rename_device_id.',
@@ -208,6 +209,22 @@ function createMcpServer(getMaxRestoreBytes: () => number, restoreState: Request
             },
         },
         wrap(getPluginInfo),
+    );
+
+    server.registerTool(
+        'get_plugin_stats',
+        {
+            description:
+                'Per-plugin resource usage read from Linux /proc: CPU % sampled over a short window, RSS and peak memory, threads, uptime (a short uptime means a recent restart), and each child process (ffmpeg, python helpers) with its own figures and command line. Also returns container memory/CPU limits and the Scrypted server process itself. Linux hosts only; plugins on remote cluster workers report running: false.',
+            inputSchema: getPluginStatsInput,
+            annotations: {
+                title: 'Get plugin resource usage',
+                readOnlyHint: true,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
+        },
+        wrap(getPluginStats),
     );
 
     server.registerTool(
