@@ -6,7 +6,9 @@ import type { HttpRequest, HttpResponse } from '@scrypted/sdk';
 // as `new URL(...)` can parse the result.
 const SYNTHETIC_ORIGIN = 'http://scrypted-mcp.local';
 
-export function toWebRequest(req: HttpRequest): Request {
+// `signal` lets the caller end a long-lived exchange from our side: the SDK tears a
+// subscriptions/listen stream down when its request's signal aborts.
+export function toWebRequest(req: HttpRequest, signal?: AbortSignal): Request {
     const method = (req.method ?? 'GET').toUpperCase();
     const url = new URL(req.url ?? '/', SYNTHETIC_ORIGIN).toString();
 
@@ -17,7 +19,7 @@ export function toWebRequest(req: HttpRequest): Request {
 
     // GET/HEAD bodies are forbidden by the Web Fetch spec. Scrypted's bodyParser.text()
     // middleware leaves `body` empty for those methods anyway, so this is just defensive.
-    const init: RequestInit = { method, headers };
+    const init: RequestInit = { method, headers, signal };
     if (method !== 'GET' && method !== 'HEAD' && req.body !== undefined) init.body = req.body;
     return new Request(url, init);
 }
@@ -31,9 +33,22 @@ export function toWebRequest(req: HttpRequest): Request {
 // cancel() is what fires the transport's ReadableStream `cancel` callback, which drops the
 // stream from its mapping and clears its keep-alive timer. Without it the abandoned stream
 // lingers with its keep-alive timer running until the per-request server is closed.
-async function* readableStreamToBufferGenerator(stream: ReadableStream<Uint8Array>): AsyncGenerator<Buffer, void> {
+//
+// `opts.signal` ends the stream from our side: on abort we cancel the reader, which runs the
+// source's cancel callback (the SDK's teardown) and ends the generator, so Scrypted closes the
+// response. The Request's own signal isn't enough: Node's Request follows the caller's signal
+// through a derived one, and that link didn't fire for an open listen stream in testing.
+async function* readableStreamToBufferGenerator(
+    stream: ReadableStream<Uint8Array>,
+    opts: StreamResponseOptions = {},
+): AsyncGenerator<Buffer, void> {
     const reader = stream.getReader();
     let finished = false;
+    const onAbort = () => {
+        reader.cancel().catch(() => {});
+    };
+    opts.signal?.addEventListener('abort', onAbort, { once: true });
+    if (opts.signal?.aborted) onAbort();
     try {
         while (true) {
             const { value, done } = await reader.read();
@@ -54,6 +69,8 @@ async function* readableStreamToBufferGenerator(stream: ReadableStream<Uint8Arra
         } catch {
             // Best-effort: a cancelled stream may already be locked-released.
         }
+        opts.signal?.removeEventListener('abort', onAbort);
+        opts.onDone?.();
     }
 }
 
@@ -70,24 +87,41 @@ function headersToPlain(headers: Headers): Record<string, string> {
 // send it as a single send() call. We pick branches off Content-Type rather than off whether
 // `body` is non-null — every Response has a ReadableStream, including 1-byte JSON ones, so
 // "is it streaming?" really means "did we negotiate text/event-stream?".
-export async function fromWebResponse(response: Response, httpResponse: HttpResponse): Promise<void> {
+//
+export interface StreamResponseOptions {
+    // Runs once the response is over: for a stream, when it ends or the client goes away
+    // (sendStream isn't awaited, so returning from fromWebResponse says nothing about that);
+    // otherwise right after the send.
+    onDone?: () => void;
+    // Aborting it ends a streamed response from our side.
+    signal?: AbortSignal;
+}
+
+export async function fromWebResponse(
+    response: Response,
+    httpResponse: HttpResponse,
+    opts: StreamResponseOptions = {},
+): Promise<void> {
     const code = response.status;
     const headers = headersToPlain(response.headers);
     const contentType = response.headers.get('content-type') ?? '';
     const isSse = contentType.toLowerCase().includes('text/event-stream');
 
     if (isSse && response.body) {
-        httpResponse.sendStream(readableStreamToBufferGenerator(response.body), { code, headers });
+        httpResponse.sendStream(readableStreamToBufferGenerator(response.body, opts), { code, headers });
         return;
     }
 
-    if (response.body) {
-        const buf = Buffer.from(await response.arrayBuffer());
-        httpResponse.send(buf, { code, headers });
-        return;
+    try {
+        if (response.body) {
+            const buf = Buffer.from(await response.arrayBuffer());
+            httpResponse.send(buf, { code, headers });
+            return;
+        }
+        httpResponse.send('', { code, headers });
+    } finally {
+        opts.onDone?.();
     }
-
-    httpResponse.send('', { code, headers });
 }
 
 // Convenience for our own OAuth handlers — they build a Response, this hands it to Scrypted.

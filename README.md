@@ -154,6 +154,32 @@ as potentially destructive. The full list is in the [tool reference](#tool-refer
 
 The MCP connection drops when the server restarts at the end of a successful restore.
 
+## Resources & events
+
+Every device is exposed as two [resources](https://modelcontextprotocol.io/specification/server/resources):
+
+- `scrypted://device/{id}/state` — the device's current property values (same shape as `get_device`).
+- `scrypted://device/{id}/events` — the device's most recent events (up to 50, oldest first), each with `time`,
+  `interface`, `property` and `data`.
+
+With **Device subscriptions** turned on (see [Events](#events)), a client on the 2026-07-28 protocol can watch these
+resources: it opens a `subscriptions/listen` stream with the URIs in `resourceSubscriptions`, gets
+`notifications/resources/updated` when a device changes, and re-reads the resource. `resourcesListChanged` reports
+devices being added or removed. Notifications are coalesced per resource (250 ms), but every event still lands in the
+`events` buffer, so a short motion blip that came and went between two reads is still visible there.
+
+Events are recorded only while someone is subscribed: the plugin starts listening to Scrypted when the first stream
+opens, keeps a buffer only for devices whose `events` URI an open stream watches, and drops it when the last watcher
+goes. Reading `events` without a subscription returns an empty list with `recording: false`. Buffers live in memory and
+start empty after a plugin reload.
+
+At most 16 streams can be open at once. A stream closes when its access token expires, when its API token is revoked,
+on **Revoke all tokens**, and when the setting is turned off. Older (2025-era) clients can read the resources but can't
+subscribe.
+
+On Scrypted older than 0.148.0, every closed stream leaks one internal connection
+([#89](https://github.com/sv-tools/scrypted-mcp-plugin/issues/89)). Update Scrypted before relying on subscriptions.
+
 ## Other clients
 
 Any MCP client that supports Streamable HTTP and OAuth, and signs in through a loopback redirect
@@ -202,6 +228,11 @@ reaching Scrypted.
 
 All four values are read at request time, so changes take effect on the next inbound request — no plugin reload
 required.
+
+### Events
+
+- **Device subscriptions** — off by default. Lets 2026-07-28 clients subscribe to device resources and be notified when
+  a device changes (see [Resources & events](#resources--events)). Turning it off closes open streams.
 
 ### Status
 
