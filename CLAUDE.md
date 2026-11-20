@@ -27,7 +27,7 @@ The plugin is one process inside Scrypted. `src/main.ts` declares `ScryptedMcpPl
 
 `src/http-bridge.ts` is the only adapter between Scrypted's `HttpRequest`/`HttpResponse` and Web-standard `Request`/`Response`. Streamed responses (Content-Type: `text/event-stream`) flow through `HttpResponse.sendStream(AsyncGenerator<Buffer>)`; everything else buffers and `send`s.
 
-**Keep legacy on JSON.** On Scrypted ≤ 0.147.x, every `sendStream()` leaks one loopback cluster connection (#89). Fixed upstream by koush/scrypted#2203 (`ea52522`) and koush/scrypted#2208, both shipped in Scrypted 0.148.0. Answering 2025-era clients with SSE leaked about one connection per call; JSON leaks none. The 2026-07-28 path only uses SSE for `subscriptions/listen`, and since we advertise `tools.listChanged: false` it's acknowledged with nothing subscribed and closes immediately. Long-lived listen streams (enabling `listChanged` or resource subscriptions) are safe on Scrypted ≥ 0.148.0 but still leak one connection per stream on older servers, so either gate them on the server version or accept the leak there.
+**Keep legacy on JSON.** On Scrypted ≤ 0.147.x, every `sendStream()` leaks one loopback cluster connection (#89). Fixed upstream by koush/scrypted#2203 (`ea52522`) and koush/scrypted#2208, both shipped in Scrypted 0.148.0. Answering 2025-era clients with SSE leaked about one connection per call; JSON leaks none. The 2026-07-28 path only uses SSE for `subscriptions/listen`. With the *Device subscriptions* setting off (the default) we advertise neither `tools.listChanged` nor `resources.subscribe`, so a listen is acknowledged with nothing subscribed and closes immediately. With it on, listen streams are long-lived (see Device resources & events); they're safe on Scrypted ≥ 0.148.0 but leak one connection per stream on older servers, which is why the setting is opt-in and `maxSubscriptions` is capped at `MAX_LISTEN_STREAMS` (16).
 
 Two SSE behaviours are inherited from the SDK (`@modelcontextprotocol/server`) rather than implemented here, and both depend on the bridge staying byte- and header-transparent:
 
@@ -37,6 +37,16 @@ Two SSE behaviours are inherited from the SDK (`@modelcontextprotocol/server`) r
 Request `Content-Type` is validated by parsed media type, not substring match, so `application/json` and `application/json; charset=utf-8` both pass but a comma-joined duplicate header 415s.
 
 `src/scrypted.ts` is a thin `getComponent(name)` wrapper around `sdk.systemManager.getComponent(...)` plus re-exports of `systemManager` / `deviceManager` / `mediaManager`. Tools that previously went through `@scrypted/client` now hit the SDK directly.
+
+## Device resources & events
+
+`src/events.ts`. Every device has two resource templates, registered in `createMcpServer`: `scrypted://device/{id}/state` (property values, same as `get_device`) and `scrypted://device/{id}/events` (ring buffer of the last `EVENT_LOG_SIZE` = 50 events). Build URIs only through `deviceStateUri` / `deviceEventsUri`: the SDK's listen router matches `resourceSubscriptions` by exact string.
+
+- **The SDK owns the wire side.** `createMcpHandler` serves `subscriptions/listen` itself (ack, per-stream filtering, subscription-id stamping, keep-alive) off an in-process `ServerEventBus`; we publish through `this.mcp.notify.resourceUpdated(uri)` / `resourcesChanged()`. In-process works because the plugin is one process; the "stateless" rule is about MCP sessions, and an open listen stream is just an open HTTP response.
+- **Capabilities are per request.** `resources.subscribe` and `resources.listChanged` are advertised only when the `events_enabled` setting is on, and never to 2025-era clients (`serveLegacy` passes `subscribe: false`): they'd call `resources/subscribe`, which 2026-07-28 replaced and we don't serve.
+- **Nothing runs without a subscriber.** `handleMcp` intercepts each `subscriptions/listen` (`openListen`) and registers it with `DeviceEventSource.open(clientId, uris, expiresAt)` before the SDK serves it. The first open stream starts one `systemManager.listen()` and a 30s device-list diff (for `resourcesChanged`); the last one to close stops both. A device's buffer exists only while some open stream watches its `events` URI. Reading `events` without one returns `recording: false`. Buffers are in memory only.
+- **Stream lifetime.** `open()` returns an `AbortController` signal. It goes to `fromWebResponse(..., { signal, onDone })`, which cancels the SSE reader on abort; that runs the SDK's stream `cancel` teardown and ends the generator, so Scrypted closes the response. It also goes on the Web `Request` (`toWebRequest(req, signal)`), but don't rely on that alone: Node's `Request` follows the caller's signal through a derived one, and in testing that never reached the SDK's listen router. `onDone` reports when the response is over (the SSE generator's `finally`, since `sendStream` isn't awaited). We close streams ourselves when the JWT expires (`expiresAt`), when an API token is revoked (`clientId === api-token:<id>`), on `revoke_all`, and when the setting is turned off; closing releases bookkeeping immediately rather than waiting for `onDone`.
+- **Coalescing.** Notifications go out at most once per URI per 250 ms; every event still lands in the buffer. Only property changes notify `state`; every event notifies `events`.
 
 ## OAuth
 
@@ -65,7 +75,8 @@ The MCP `/mcp` path requires a Bearer JWT or API token in `Authorization`, not t
 
 - **Endpoint** (read-only): `mcp_endpoint_https`, `mcp_endpoint_http` — derived from `endpointManager.getLocalEndpoint`.
 - **API Tokens**: `api_token_create` (string; saving a non-empty name creates a token), `api_token_new` (read-only, one-shot in-memory plaintext of the last-created token), one `api_token_revoke.<id>` button per token (click revokes it; `api_tokens` is the read-only "none" row when there are no tokens, and a no-op key otherwise).
-- **Configuration** (editable): `dcr_max_clients`, `access_token_ttl_sec`, `refresh_token_ttl_sec`, `max_restore_mb`. Bounds are enforced by `readIntegerSetting()` on read AND by `writeIntegerSetting()` on save, so a hand-edited storage value out of range silently falls back to the default.
+- **Configuration** (editable): `dcr_max_clients`, `access_token_ttl_sec`, `refresh_token_ttl_sec`, `max_restore_mb`.
+- **Events** (editable): `events_enabled` (boolean, default off, storage `settings.events_enabled`). Off closes open listen streams. Bounds are enforced by `readIntegerSetting()` on read AND by `writeIntegerSetting()` on save, so a hand-edited storage value out of range silently falls back to the default.
 - **Status** (read-only + one button): `registered_clients`, `active_refresh_tokens`, plus the destructive `revoke_all` button. (There is no `active_sessions` count; the server is stateless.) Counts come from `OAuthService.getStats()` via the same DOM Storage iteration used by the LRU/sweep code.
 
 Token-lifetime constants and bounds (`DEFAULT_ACCESS_TOKEN_TTL_SEC`, `ACCESS_TOKEN_TTL_MIN_SEC`, etc.) live in `oauth.ts` so the AS layer and the Settings layer can't drift on what counts as a valid TTL.

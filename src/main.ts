@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import {
     McpServer,
+    ResourceTemplate,
     WebStandardStreamableHTTPServerTransport,
     createMcpHandler,
     createRequestStateCodec,
@@ -19,6 +20,15 @@ import sdk, {
     type Settings,
 } from '@scrypted/sdk';
 import { API_TOKEN_NAME_MAX_LEN, apiTokenSummary } from './api-tokens';
+import {
+    DEVICE_EVENTS_URI_TEMPLATE,
+    DEVICE_STATE_URI_TEMPLATE,
+    DeviceEventSource,
+    EVENT_LOG_SIZE,
+    MAX_LISTEN_STREAMS,
+    deviceEventsUri,
+    deviceStateUri,
+} from './events';
 import { fromWebResponse, sendJson, sendText, toWebRequest } from './http-bridge';
 import {
     ACCESS_TOKEN_TTL_MAX_SEC,
@@ -149,9 +159,18 @@ function wrap<TArgs, TResult>(handler: (args: TArgs) => Promise<TResult>, opts: 
 // `getMaxRestoreBytes` is plumbed through so tools that need access to plugin settings
 // (currently just restore_backup) can read the live value without coupling to the plugin
 // instance directly.
-function createMcpServer(getMaxRestoreBytes: () => number, restoreState: RequestStateCodec<RestoreState>): McpServer {
+//
+// `subscribe` advertises resources.subscribe and resources.listChanged, which let a
+// 2026-07-28 client watch device resources on a subscriptions/listen stream. Off for
+// 2025-era clients (they'd use resources/subscribe, which we don't serve) and when the
+// events setting is off. `events` backs the device events resource.
+function createMcpServer(
+    getMaxRestoreBytes: () => number,
+    restoreState: RequestStateCodec<RestoreState>,
+    opts: { subscribe: boolean; events: DeviceEventSource },
+): McpServer {
     const server = new McpServer(
-        { name: 'scrypted-mcp', version: '1.4.0' },
+        { name: 'scrypted-mcp', version: '1.5.0' },
         {
             instructions: [
                 'This MCP server runs inside a Scrypted plugin and controls the same Scrypted server (https://scrypted.app).',
@@ -165,6 +184,7 @@ function createMcpServer(getMaxRestoreBytes: () => number, restoreState: Request
                 'Backup: create_backup returns the ZIP inline as a base64 blob; restore_backup takes a base64 blob input and is destructive (asks the user to confirm before it runs).',
                 'Tool annotations are set: prefer readOnly tools freely; destructive tools (set_*, clear_*, remove_*, kill_*, restart/update_server, restore_backup) should be surfaced to the user first.',
                 'Logs are retained ~48h; pass `sinceMs` to focus on a recent window.',
+                'Resources: scrypted://device/{id}/state (current property values) and scrypted://device/{id}/events (recent events, recorded only while subscribed). When the server advertises resources.subscribe, watch them on subscriptions/listen and re-read on notifications/resources/updated.',
             ].join(' '),
             // restore_backup asks for confirmation with a multi-round-trip input request, and
             // the echoed requestState is the proof the server asked. Verify it before the
@@ -174,10 +194,80 @@ function createMcpServer(getMaxRestoreBytes: () => number, restoreState: Request
             // advertises listChanged: true, and every subscriptions/listen holds an SSE stream
             // open through Scrypted's sendStream(), which leaks a cluster connection on
             // Scrypted < 0.148.0 (#89).
-            // With it, listen is acknowledged with nothing subscribed and closes at once.
-            capabilities: { tools: { listChanged: false } },
+            // With it, listen is acknowledged with nothing subscribed and closes at once,
+            // unless the client asks for device state resources and events are enabled.
+            capabilities: {
+                tools: { listChanged: false },
+                resources: { subscribe: opts.subscribe, listChanged: opts.subscribe },
+            },
             requestState: { verify: restoreState.verify },
             inputRequired: { legacyShim: false },
+        },
+    );
+
+    server.registerResource(
+        'device_state',
+        new ResourceTemplate(DEVICE_STATE_URI_TEMPLATE, {
+            list: async () => {
+                const { devices } = await listDevices({});
+                return {
+                    resources: devices.map(d => ({
+                        uri: deviceStateUri(d.id),
+                        name: d.name || d.id,
+                        mimeType: 'application/json',
+                    })),
+                };
+            },
+        }),
+        {
+            title: 'Device state',
+            description:
+                'Current property values of one Scrypted device (same shape as get_device). Subscribe on a subscriptions/listen stream to be told when it changes.',
+            mimeType: 'application/json',
+        },
+        async (uri, variables) => {
+            const id = String(variables.id);
+            const state = await getDevice({ id });
+            return {
+                contents: [{ uri: uri.href, mimeType: 'application/json', text: JSON.stringify(state, null, 2) }],
+            };
+        },
+    );
+
+    server.registerResource(
+        'device_events',
+        new ResourceTemplate(DEVICE_EVENTS_URI_TEMPLATE, {
+            list: async () => {
+                const { devices } = await listDevices({});
+                return {
+                    resources: devices.map(d => ({
+                        uri: deviceEventsUri(d.id),
+                        name: `${d.name || d.id} events`,
+                        mimeType: 'application/json',
+                    })),
+                };
+            },
+        }),
+        {
+            title: 'Device events',
+            description: `Recent events of one Scrypted device (up to ${EVENT_LOG_SIZE}, oldest first): time, interface, property, data. Recording starts when a subscriptions/listen stream subscribes to this URI and stops when the last one closes; without a subscription the list is empty.`,
+            mimeType: 'application/json',
+        },
+        async (uri, variables) => {
+            const id = String(variables.id);
+            if (!sdk.systemManager.getSystemState()[id]) throw new Error(`device ${id} not found`);
+            const events = opts.events.recentEvents(id);
+            const body = events
+                ? { id, recording: true, events }
+                : {
+                      id,
+                      recording: false,
+                      events: [],
+                      note: 'Not recording: subscribe to this URI on subscriptions/listen to start.',
+                  };
+            return {
+                contents: [{ uri: uri.href, mimeType: 'application/json', text: JSON.stringify(body, null, 2) }],
+            };
         },
     );
 
@@ -854,6 +944,7 @@ const STORAGE_KEY_DCR_MAX_CLIENTS = 'settings.dcr_max_clients';
 const STORAGE_KEY_ACCESS_TOKEN_TTL_SEC = 'settings.access_token_ttl_sec';
 const STORAGE_KEY_REFRESH_TOKEN_TTL_SEC = 'settings.refresh_token_ttl_sec';
 const STORAGE_KEY_MAX_RESTORE_MB = 'settings.max_restore_mb';
+const STORAGE_KEY_EVENTS_ENABLED = 'settings.events_enabled';
 // Settings key prefix for the per-token revoke buttons; the suffix is the token id.
 const API_TOKEN_REVOKE_KEY_PREFIX = 'api_token_revoke.';
 const STORAGE_KEY_REQUEST_STATE_KEY = 'mcp.request_state_key';
@@ -891,7 +982,8 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
     private newApiToken?: { token: string; name: string; expiresAt: number };
     private restoreState!: RequestStateCodec<RestoreState>;
     private mcp!: ReturnType<typeof createMcpHandler>;
-    private makeServer!: () => McpServer;
+    private makeServer!: (subscribe: boolean) => McpServer;
+    private events: DeviceEventSource;
 
     constructor(nativeId?: string) {
         super(nativeId);
@@ -906,6 +998,7 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
         this.console.log(
             '[scrypted-mcp] OAuth metadata at the same /public/.well-known/oauth-protected-resource path.',
         );
+        this.events = new DeviceEventSource(() => this.mcp.notify, this.console);
         this.buildMcpHandler();
     }
 
@@ -921,9 +1014,11 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
             // can't be replayed by another.
             bind: ctx => `${ctx.mcpReq.method}\0${ctx.http?.authInfo?.clientId ?? ''}`,
         });
-        this.makeServer = () => createMcpServer(() => this.getMaxRestoreBytes(), this.restoreState);
-        this.mcp = createMcpHandler(this.makeServer, {
+        this.makeServer = subscribe =>
+            createMcpServer(() => this.getMaxRestoreBytes(), this.restoreState, { subscribe, events: this.events });
+        this.mcp = createMcpHandler(() => this.makeServer(this.getEventsEnabled()), {
             legacy: 'reject',
+            maxSubscriptions: MAX_LISTEN_STREAMS,
             onerror: e => this.console.error('[scrypted-mcp] MCP handler error:', e),
         });
     }
@@ -981,6 +1076,10 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
 
     private getMaxRestoreBytes(): number {
         return this.getMaxRestoreMb() * 1024 * 1024;
+    }
+
+    private getEventsEnabled(): boolean {
+        return this.storage.getItem(STORAGE_KEY_EVENTS_ENABLED) === 'true';
     }
 
     // Read-only display: build the URL clients should connect to. Wraps the SDK's
@@ -1083,6 +1182,18 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
                 value: this.getMaxRestoreMb(),
             },
             {
+                key: 'events_enabled',
+                title: 'Device subscriptions',
+                description: [
+                    'Let 2026-07-28 clients subscribe to scrypted://device/{id}/state and /events resources and be notified when a device changes.',
+                    'Events are recorded only for devices someone is subscribed to. Turning this off closes open streams.',
+                    `At most ${MAX_LISTEN_STREAMS} streams at once; on Scrypted older than 0.148.0 each closed stream leaks a connection.`,
+                ].join(' '),
+                type: 'boolean',
+                group: 'Events',
+                value: this.getEventsEnabled(),
+            },
+            {
                 key: 'registered_clients',
                 title: 'Registered DCR clients',
                 description: 'Persisted client registrations in plugin storage.',
@@ -1136,6 +1247,11 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
             );
         } else if (key === 'max_restore_mb') {
             this.writeIntegerSetting(key, value, STORAGE_KEY_MAX_RESTORE_MB, MIN_MAX_RESTORE_MB, MAX_MAX_RESTORE_MB);
+        } else if (key === 'events_enabled') {
+            const enabled = value === true || value === 'true';
+            this.storage.setItem(STORAGE_KEY_EVENTS_ENABLED, String(enabled));
+            // Turning it off closes open listen streams; new ones are acknowledged with nothing.
+            if (!enabled) this.events.close();
         } else if (key === 'api_token_create') {
             const name = typeof value === 'string' ? value.trim() : '';
             if (!name) return;
@@ -1144,9 +1260,13 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
         } else if (key.startsWith(API_TOKEN_REVOKE_KEY_PREFIX)) {
             // One button per token. Revoked tokens fail verification on the next request, so
             // clients using them stop working without an explicit close.
-            this.oauth.apiTokens.revoke(key.slice(API_TOKEN_REVOKE_KEY_PREFIX.length));
+            const id = key.slice(API_TOKEN_REVOKE_KEY_PREFIX.length);
+            this.oauth.apiTokens.revoke(id);
+            // Nothing re-checks the token on an open listen stream, so close its streams here.
+            this.events.close(clientId => clientId === `api-token:${id}`);
         } else if (key === 'revoke_all') {
             const counts = await this.oauth.revokeAll();
+            this.events.close();
             this.storage.removeItem(STORAGE_KEY_REQUEST_STATE_KEY);
             this.buildMcpHandler();
             this.newApiToken = undefined;
@@ -1310,8 +1430,29 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
         }
         // 2026-07-28: each request carries its protocol version and capabilities, and gets a
         // fresh McpServer. Responses are plain JSON unless a tool emits a message first.
-        const webRes = await this.mcp.fetch(webReq, { parsedBody, authInfo });
-        await fromWebResponse(webRes, res);
+        const listen = this.openListen(parsedBody, authInfo);
+        try {
+            const webRes = await this.mcp.fetch(listen ? toWebRequest(req, listen.signal) : webReq, {
+                parsedBody,
+                authInfo,
+            });
+            await fromWebResponse(webRes, res, listen && { onDone: listen.done, signal: listen.signal });
+        } catch (e) {
+            listen?.done();
+            throw e;
+        }
+    }
+
+    // A subscriptions/listen request is registered with the event source before the SDK
+    // serves it: that's what starts recording for the URIs it watches, and what lets us close
+    // the stream later (setting off, token revoked or expired). With events off we don't
+    // register it; the SDK acknowledges it with nothing subscribed and closes it.
+    private openListen(parsedBody: unknown, authInfo: SdkAuthInfo) {
+        const msg = parsedBody as { method?: unknown; params?: any } | undefined;
+        if (msg?.method !== 'subscriptions/listen' || !this.getEventsEnabled()) return undefined;
+        const requested = msg.params?.notifications?.resourceSubscriptions;
+        const uris = Array.isArray(requested) ? requested.filter((u): u is string => typeof u === 'string') : [];
+        return this.events.open(authInfo.clientId, uris, authInfo.expiresAt);
     }
 
     // 2025-era clients: one stateless server per request, answering with plain JSON rather than
@@ -1334,7 +1475,7 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
             sessionIdGenerator: undefined,
             enableJsonResponse: true,
         });
-        const server = this.makeServer();
+        const server = this.makeServer(false);
         try {
             await server.connect(transport);
             await fromWebResponse(await transport.handleRequest(webReq, { parsedBody, authInfo }), res);
