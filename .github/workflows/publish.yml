@@ -11,8 +11,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      # id-token is required for npm publish provenance — provenance signs the package
-      # via the GitHub OIDC token so consumers can verify it was built by this workflow.
+      # id-token lets npm publish through trusted publishing (OIDC, no stored token) and sign
+      # provenance, so consumers can verify the package was built by this workflow.
       id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -21,7 +21,6 @@ jobs:
         with:
           node-version-file: '.nvmrc'
           cache: 'npm'
-          # Configures npm with the registry URL so NODE_AUTH_TOKEN is honored at publish.
           registry-url: 'https://registry.npmjs.org'
 
       - name: Verify package.json version matches git tag
@@ -46,7 +45,6 @@ jobs:
       - name: Build (scrypted-webpack)
         run: npm run build
 
+      # Authenticates through npm trusted publishing (OIDC); no npm token is stored.
       - name: Publish to npm
         run: npm publish --access public --provenance
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
