@@ -172,7 +172,8 @@ function createMcpServer(getMaxRestoreBytes: () => number, restoreState: Request
             // the round trip, so fail those immediately instead of waiting out its timeout.
             // The tool list is fixed for the life of the process. Without this, registerTool
             // advertises listChanged: true, and every subscriptions/listen holds an SSE stream
-            // open through Scrypted's sendStream(), which leaks a cluster connection (#89).
+            // open through Scrypted's sendStream(), which leaks a cluster connection on
+            // Scrypted < 0.148.0 (#89).
             // With it, listen is acknowledged with nothing subscribed and closes at once.
             capabilities: { tools: { listChanged: false } },
             requestState: { verify: restoreState.verify },
@@ -1315,7 +1316,7 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
 
     // 2025-era clients: one stateless server per request, answering with plain JSON rather than
     // an SSE stream. Every SSE response goes out through Scrypted's sendStream(), which leaks one
-    // cluster connection per response on current Scrypted servers (#89, koush/scrypted#2203).
+    // cluster connection per response on Scrypted < 0.148.0 (#89, koush/scrypted#2203).
     // Nothing these clients use needs a mid-request stream; restore_backup's confirmation is
     // only available on 2026-07-28. No sessions, so GET and DELETE have nothing to act on.
     private async serveLegacy(
