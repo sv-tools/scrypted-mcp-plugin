@@ -12,6 +12,8 @@ const { getStorage, listPlugins, setStorage } = require('../src/tools/plugins');
 const { getLogs } = require('../src/tools/logs');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { listAlerts } = require('../src/tools/alerts');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { getServerInfo } = require('../src/tools/server');
 
 function makeMediaObjectProxy(props: { mimeType: string; sourceId?: string; toMimeTypes?: string[] }) {
     return new Proxy(
@@ -177,5 +179,21 @@ describe('device, plugin, log, and alert tools', () => {
         mockState.devices['99'] = { pluginId: 'scrypted-mcp' };
         await assert.rejects(() => getStorage({ id: '99' }), /refusing to read\/write/);
         await assert.rejects(() => setStorage({ id: '99', storage: {} }), /refusing to read\/write/);
+    });
+
+    it('getServerInfo strips sensitive env vars including AUTHORIZATION', async () => {
+        mockState.components.info = {
+            getVersion: async () => '0.148.0',
+            getScryptedEnv: async () => ({
+                SCRYPTED_INSTALL_ENVIRONMENT: 'docker',
+                SCRYPTED_WEBHOOK_UPDATE_AUTHORIZATION: 'Bearer real-secret',
+                SCRYPTED_API_TOKEN: 'tok',
+                SCRYPTED_ADMIN_PASSWORD: 'pw',
+            }),
+        };
+
+        const info = await getServerInfo();
+        assert.equal(info.version, '0.148.0');
+        assert.deepEqual(info.env, { SCRYPTED_INSTALL_ENVIRONMENT: 'docker' });
     });
 });
