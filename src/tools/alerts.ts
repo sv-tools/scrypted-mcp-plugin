@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { redactSecrets } from '../redact';
 import { getComponent } from '../scrypted';
 
 // ScryptedAlert shape, mirrors server/src/db-types.ts. We surface every field so the LLM can
@@ -41,7 +42,7 @@ export async function listAlerts(args: z.infer<typeof listAlertsInput>) {
             ts: new Date(a.timestamp).toISOString(),
             title: a.title,
             path: a.path,
-            message: a.message,
+            message: redactSecrets(String(a.message ?? '')),
         })),
     };
 }

@@ -61,7 +61,7 @@ Ask your assistant something like:
 
 | Area                    | For example                                                     | Changes things? |
 |-------------------------|-----------------------------------------------------------------|-----------------|
-| Plugins                 | List, inspect, install, update, reload, read or change storage  | Some tools      |
+| Plugins                 | List, inspect, check CPU/memory, install, update, reload, storage | Some tools      |
 | Devices                 | List devices, read state, grab camera snapshots, call methods   | Some tools      |
 | Logs & alerts           | Read server logs and alerts, clear them                         | Some tools      |
 | Server administration   | Version and environment, restart, update, edit `.env`           | Some tools      |
@@ -80,6 +80,7 @@ as potentially destructive. The full list is in the [tool reference](#tool-refer
 
 - `list_plugins` — All installed plugins with id / pluginId / name / type.
 - `get_plugin_info` — pid, pending RPC calls, object count for one plugin.
+- `get_plugin_stats` — Per-plugin CPU % and memory (including child processes such as ffmpeg) read from Linux `/proc`, plus container limits and the Scrypted server process.
 - `reload_plugin` — Restart a plugin host (picks up code changes).
 - `kill_plugin` — Kill a plugin host without auto-reload.
 - `install_plugin` — Install / upgrade a plugin from npm.

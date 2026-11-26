@@ -43,16 +43,17 @@ export const listPluginsInput = z.object({});
 
 export async function listPlugins() {
     const state = systemManager.getSystemState();
-    // A plugin's controller device has type 'API' — but a more robust signal is a populated
-    // `pluginId` property equal to the device's own nativeId. We surface both ids and the
-    // human-readable name so the LLM can pick the right one for follow-ups.
+    // Every device carries its owning plugin's `pluginId`, while only the plugin's root
+    // controller device has no `nativeId`. Surface both ids and the human-readable name so
+    // the LLM can pick the right one for follow-ups.
     const plugins: Array<{ id: string; pluginId: string; name: string; type: string }> = [];
     for (const id of Object.keys(state)) {
         const dev = state[id];
         const pluginId = dev?.pluginId?.value;
+        const nativeId = dev?.nativeId?.value;
         const name = dev?.name?.value;
         const type = dev?.type?.value;
-        if (pluginId && name) plugins.push({ id, pluginId, name, type: type ?? '' });
+        if (pluginId && name && !nativeId) plugins.push({ id, pluginId, name, type: type ?? '' });
     }
     plugins.sort((a, b) => a.name.localeCompare(b.name));
     return { count: plugins.length, plugins };
@@ -265,9 +266,12 @@ function readConsoleViaPort(port: number, host: string, nativeId: string | undef
     return new Promise((resolve, reject) => {
         const chunks: Buffer[] = [];
         let bytes = 0;
+        let settled = false;
         let idle: NodeJS.Timeout | undefined;
         const socket = net.connect({ port, host });
         const finish = () => {
+            if (settled) return;
+            settled = true;
             clearTimeout(idle);
             clearTimeout(cap);
             socket.destroy();
@@ -286,7 +290,11 @@ function readConsoleViaPort(port: number, host: string, nativeId: string | undef
             if (bytes >= PORT_READ_MAX_BYTES) finish();
             else idle = setTimeout(finish, PORT_READ_IDLE_MS);
         });
+        socket.on('end', finish);
+        socket.on('close', finish);
         socket.on('error', e => {
+            if (settled) return;
+            settled = true;
             clearTimeout(idle);
             clearTimeout(cap);
             reject(e);

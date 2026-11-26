@@ -45,6 +45,13 @@ export const REFRESH_TOKEN_TTL_MAX_SEC = 365 * 24 * 60 * 60; // 1 year ceiling
 const AUTH_CODE_TTL_MS = 60 * 1000; // 60s — codes are exchanged immediately by the client.
 const SUPPORTED_SCOPES = ['mcp'];
 
+// Bounds on unauthenticated DCR (/register) payload fields so a single registration can't
+// bloat Scrypted's plugin storage even under the `dcr_max_clients` client-count cap.
+const MAX_DCR_REDIRECT_URIS = 16;
+const MAX_DCR_REDIRECT_URI_LEN = 2048;
+const MAX_DCR_CLIENT_NAME_LEN = 128;
+const MAX_DCR_SCOPE_LEN = 256;
+
 // Storage keys. Kept under a namespace so they don't collide with whatever else the plugin
 // might persist later.
 const STORAGE_KEY_SIGNING_JWK = 'oauth.signing_jwk';
@@ -132,7 +139,8 @@ function base64urlNoPad(buf: Buffer): string {
 // back to `${host}/register`, and the user sees a host-root Express 404.
 function originFromRequest(req: HttpRequest): string {
     const headers = req.headers ?? {};
-    const xfProto = headers['x-forwarded-proto']?.split(',')[0].trim();
+    const rawProto = headers['x-forwarded-proto']?.split(',')[0].trim().toLowerCase();
+    const xfProto = rawProto === 'http' || rawProto === 'https' ? rawProto : undefined;
     const xfHost = headers['x-forwarded-host']?.split(',')[0].trim();
 
     const host = xfHost || headers['host'] || 'localhost';
@@ -203,8 +211,9 @@ function isAllowedRedirectUri(uri: string): boolean {
         return false;
     }
     if (url.protocol !== 'http:') return false;
+    // WHATWG URL keeps square brackets around IPv6 hostnames (`[::1]`).
     const host = url.hostname.toLowerCase();
-    return host === 'localhost' || host === '127.0.0.1' || host === '::1';
+    return host === 'localhost' || host === '127.0.0.1' || host === '[::1]' || host === '::1';
 }
 
 // Reject scopes the AS doesn't advertise. Returning the intersection (rather than the raw
@@ -643,7 +652,7 @@ export class OAuthService {
     async verifyBearer(req: HttpRequest): Promise<AuthInfo | undefined> {
         const auth = req.headers?.['authorization'];
         if (!auth) return undefined;
-        const m = /^Bearer\s+(.+)$/i.exec(auth);
+        const m = /^Bearer\s+(\S+)\s*$/i.exec(auth);
         if (!m) {
             // Don't log the header value: when the regex fails on something like
             // "Bearer\nxyz..." (rare, but possible with unusual whitespace) the contents
@@ -787,6 +796,20 @@ export class OAuthService {
             });
             return;
         }
+        if (redirectUris.length > MAX_DCR_REDIRECT_URIS) {
+            sendJson(res, 400, {
+                error: 'invalid_redirect_uri',
+                error_description: `at most ${MAX_DCR_REDIRECT_URIS} redirect_uris allowed`,
+            });
+            return;
+        }
+        if (redirectUris.some(u => u.length > MAX_DCR_REDIRECT_URI_LEN)) {
+            sendJson(res, 400, {
+                error: 'invalid_redirect_uri',
+                error_description: `redirect_uri must be at most ${MAX_DCR_REDIRECT_URI_LEN} characters`,
+            });
+            return;
+        }
         const badUris = redirectUris.filter(u => !isAllowedRedirectUri(u));
         if (badUris.length > 0) {
             sendJson(res, 400, {
@@ -794,6 +817,23 @@ export class OAuthService {
                 error_description:
                     'redirect_uri must be loopback HTTP (http://localhost, http://127.0.0.1, or http://[::1]); rejected: ' +
                     badUris.join(', '),
+            });
+            return;
+        }
+
+        const clientName = asString(body.client_name);
+        if (clientName && clientName.length > MAX_DCR_CLIENT_NAME_LEN) {
+            sendJson(res, 400, {
+                error: 'invalid_client_metadata',
+                error_description: `client_name must be at most ${MAX_DCR_CLIENT_NAME_LEN} characters`,
+            });
+            return;
+        }
+        const rawScope = asString(body.scope);
+        if (rawScope && rawScope.length > MAX_DCR_SCOPE_LEN) {
+            sendJson(res, 400, {
+                error: 'invalid_client_metadata',
+                error_description: `scope must be at most ${MAX_DCR_SCOPE_LEN} characters`,
             });
             return;
         }
@@ -811,13 +851,13 @@ export class OAuthService {
             client_id: randomUUID(),
             client_id_issued_at: Math.floor(Date.now() / 1000),
             redirect_uris: redirectUris,
-            client_name: asString(body.client_name),
+            client_name: clientName,
             grant_types: grantTypes,
             response_types: asStringArray(body.response_types) ?? ['code'],
             // We are a public-client AS — PKCE-only, no client_secret. Anything else would be
             // dishonest because we can't actually authenticate the client.
             token_endpoint_auth_method: 'none',
-            scope: asString(body.scope) ?? SUPPORTED_SCOPES.join(' '),
+            scope: rawScope ?? SUPPORTED_SCOPES.join(' '),
         };
         this.clients.set(client);
         this.console.log(
@@ -966,6 +1006,14 @@ export class OAuthService {
             return;
         }
         const body = parseBody(req.body);
+        const ep = this.endpoints(req);
+        if (body.resource !== undefined && body.resource !== ep.resource) {
+            sendJson(res, 400, {
+                error: 'invalid_target',
+                error_description: `resource must equal "${ep.resource}" (the only resource this AS issues tokens for)`,
+            });
+            return;
+        }
         const grantType = asString(body.grant_type);
         if (grantType === 'authorization_code') {
             await this.handleAuthorizationCodeGrant(req, res, body);

@@ -27,10 +27,11 @@
         "scrypted-deploy": "scrypted-deploy",
         "scrypted-readme": "scrypted-readme",
         "scrypted-package-json": "scrypted-package-json",
-        "fmt": "prettier --write \"src/**/*.ts\"",
-        "fmt:check": "prettier --check \"src/**/*.ts\"",
-        "lint": "eslint src",
-        "lint:fix": "eslint src --fix"
+        "fmt": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
+        "fmt:check": "prettier --check \"src/**/*.ts\" \"test/**/*.ts\"",
+        "lint": "eslint src test",
+        "lint:fix": "eslint src test --fix",
+        "test": "tsc -p tsconfig.test.json && node --test \"build/test/test/*.test.js\""
     },
     "keywords": [
         "scrypted",

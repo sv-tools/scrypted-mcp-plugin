@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { redactSecrets } from '../redact';
 import { getComponent } from '../scrypted';
 
 // The Logger component returns the entire in-memory log buffer (Scrypted purges entries
@@ -62,7 +63,7 @@ export async function getLogs(args: z.infer<typeof getLogsInput>) {
             ts: new Date(e.timestamp).toISOString(),
             level: e.level,
             title: e.title,
-            message: e.message,
+            message: redactSecrets(String(e.message ?? '')),
         })),
     };
 }
