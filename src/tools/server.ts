@@ -22,7 +22,7 @@ export const getServerInfoInput = z.object({});
 // Keys matching this pattern are redacted from get_server_info responses.
 // Credentials in env vars (tokens, secrets, passwords, API keys) must not be
 // returned to MCP clients — the tool is read-only and informational only.
-const SENSITIVE_ENV_KEY = /TOKEN|SECRET|PASSWORD|KEY/i;
+const SENSITIVE_ENV_KEY = /TOKEN|SECRET|PASSWORD|KEY|AUTH/i;
 
 export async function getServerInfo() {
     // Combine version + SCRYPTED_* env into one snapshot — saves a round-trip when the LLM

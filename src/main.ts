@@ -173,7 +173,7 @@ function createMcpServer(
     opts: { subscribe: boolean; events: DeviceEventSource },
 ): McpServer {
     const server = new McpServer(
-        { name: 'scrypted-mcp', version: '1.5.0' },
+        { name: 'scrypted-mcp', version: '1.6.0' },
         {
             instructions: [
                 'This MCP server runs inside a Scrypted plugin and controls the same Scrypted server (https://scrypted.app).',
