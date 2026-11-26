@@ -38,6 +38,7 @@ function readProcTable(): Map<number, ProcSample> {
             // comm is parenthesized and may itself contain spaces or ')', so split after the
             // last ')'. The remainder starts at field 3 (state).
             const close = raw.lastIndexOf(')');
+            if (close < 0) continue;
             const comm = raw.slice(raw.indexOf('(') + 1, close);
             const f = raw
                 .slice(close + 2)
@@ -186,8 +187,10 @@ export async function getPluginStats(args: z.infer<typeof getPluginStatsInput>) 
     const describe = (pid: number) => {
         const now = after.get(pid)!;
         const prev = before.get(pid);
-        // A pid absent from the first snapshot started inside the window; measure from zero.
-        const cpu = ((now.ticks - (prev?.ticks ?? 0)) / CLK_TCK / elapsedSec) * 100;
+        // A pid absent from the first snapshot (or recycled to a new process with a different
+        // startTicks) started inside the window; measure from zero.
+        const prevTicks = prev && prev.startTicks === now.startTicks ? prev.ticks : 0;
+        const cpu = Math.max(0, ((now.ticks - prevTicks) / CLK_TCK / elapsedSec) * 100);
         const mem = readMemory(pid);
         return {
             pid,

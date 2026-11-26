@@ -115,6 +115,7 @@ export class DeviceEventSource {
         if (expiresAtSec !== undefined) {
             const ms = Math.max(0, expiresAtSec * 1000 - Date.now());
             stream.expiry = setTimeout(() => this.end(stream), ms);
+            stream.expiry.unref();
         }
         this.start();
         let finished = false;
@@ -149,8 +150,9 @@ export class DeviceEventSource {
     // Recent events for one device, oldest first, or undefined when no open stream watches
     // its events URI (so nothing is being recorded).
     recentEvents(id: string): DeviceEvent[] | undefined {
+        if (!this.watchers.has(deviceEventsUri(id))) return undefined;
         const log = this.logs.get(id);
-        return log ? [...log] : undefined;
+        return log ? [...log] : [];
     }
 
     private release(stream: ListenStream): void {
@@ -179,6 +181,7 @@ export class DeviceEventSource {
             if (id) this.onEvent(id, details, data);
         });
         this.poll = setInterval(() => this.checkDeviceList(), DEVICE_LIST_POLL_MS);
+        this.poll.unref();
     }
 
     private stop(): void {

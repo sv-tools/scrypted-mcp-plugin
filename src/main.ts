@@ -1224,7 +1224,7 @@ class ScryptedMcpPlugin extends ScryptedDeviceBase implements HttpRequestHandler
             {
                 key: 'active_refresh_tokens',
                 title: 'Persisted refresh tokens',
-                description: 'Refresh tokens currently in plugin storage (each has a 30-day TTL).',
+                description: 'Refresh tokens currently in plugin storage (lifetime set by Refresh token TTL above).',
                 type: 'integer',
                 group: 'Status',
                 readonly: true,

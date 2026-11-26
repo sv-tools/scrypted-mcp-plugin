@@ -16,10 +16,11 @@ const SECRET_PATTERNS: Array<[RegExp, (m: string, ...groups: string[]) => string
     // rtsp(s)://host/<path>: stream paths often are the credential (UniFi Protect's
     // rtsps://host:7441/<token>), so keep the host for debugging and drop the path.
     [/\b(rtsps?:\/\/[^\s/'"]{1,255}\/)[^\s'"]+/gi, (_m, prefix) => `${prefix}[REDACTED]`],
-    // Authorization: Bearer xyz / Basic xyz
+    // Authorization: Bearer xyz / Basic xyz, including JSON ("Authorization": "Basic xyz")
     [
-        /\b(authorization\s{0,8}[:=]\s{0,8}["']?)(?:bearer|basic|digest)?\s{0,8}[^\s"',]+/gi,
-        (_m, prefix) => `${prefix}[REDACTED]`,
+        /\b(authorization["']?\s{0,8}[:=]\s{0,8})(["']?)(?:bearer|basic|digest)?\s{0,8}[^\s"',}]+(["']?)/gi,
+        (_m, prefix, openQuote, closeQuote) =>
+            `${prefix}${openQuote}[REDACTED]${openQuote && closeQuote ? closeQuote : ''}`,
     ],
     // bare bearer tokens
     [/\b(bearer\s{1,8})[a-z0-9._~+/-]+=*/gi, (_m, prefix) => `${prefix}[REDACTED]`],

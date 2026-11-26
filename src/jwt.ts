@@ -142,7 +142,9 @@ export async function verifyJwt(key: SigningKey, token: string, opts: VerifyOpti
     if (parts.length !== 3) throw new Error('malformed jwt');
     const [headerB64, payloadB64, sigB64] = parts;
     const header = JSON.parse(decoder.decode(base64urlDecode(headerB64)));
-    if (header.alg !== ALG) throw new Error(`unsupported alg ${header.alg}`);
+    if (!header || typeof header !== 'object' || header.alg !== ALG) {
+        throw new Error(`unsupported alg ${header?.alg}`);
+    }
 
     const ok = await subtle.verify(
         { name: 'ECDSA', hash: 'SHA-256' },
@@ -154,7 +156,7 @@ export async function verifyJwt(key: SigningKey, token: string, opts: VerifyOpti
 
     const payload = JSON.parse(decoder.decode(base64urlDecode(payloadB64))) as JWTPayload;
     const now = Math.floor(Date.now() / 1000);
-    if (typeof payload.exp !== 'number' || payload.exp < now) throw new Error('jwt expired');
+    if (typeof payload.exp !== 'number' || payload.exp <= now) throw new Error('jwt expired');
     if (payload.iss !== opts.issuer) throw new Error('jwt iss mismatch');
     if (payload.aud !== opts.audience) throw new Error('jwt aud mismatch');
     return payload;

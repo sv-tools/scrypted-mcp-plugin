@@ -6,6 +6,7 @@ Scrypted plugin that exposes a Streamable HTTP Model Context Protocol endpoint. 
 
 ```bash
 npm run build       # scrypted-webpack → out/main.nodejs.js (+ plugin.zip)
+npm test            # compile tsconfig.test.json → node --test
 npm run fmt         # prettier --write
 npm run fmt:check   # CI gate
 npm run lint        # eslint
@@ -13,7 +14,7 @@ npm run lint:fix
 npm run scrypted-deploy-debug   # build + push to a running Scrypted server (see SDK docs)
 ```
 
-CI runs `fmt:check`, `lint`, `build` on every push/PR (`.github/workflows/ci.yml`). `publish.yml` runs on `v*` tags and pushes to npm.
+CI runs `fmt:check`, `lint`, `test`, `build` on every push/PR (`.github/workflows/ci.yml`). `publish.yml` runs on `v*` tags and pushes to npm.
 
 ## Architecture
 
@@ -34,7 +35,7 @@ Two SSE behaviours are inherited from the SDK (`@modelcontextprotocol/server`) r
 - **Keep-alive.** The transport writes `: keepalive` comment frames into the SSE stream every 15s (`keepAliveMs`, default `DEFAULT_SSE_KEEP_ALIVE_MS`). This is what stops a reverse proxy from reaping a stream that idles — the `subscriptions/listen` stream, or a long tool call such as `create_backup` on a large database. (The `restore_backup` confirmation no longer holds a stream open while the human answers; see Destructive tool gating.) `readableStreamToBufferGenerator` must therefore keep forwarding every non-empty chunk; the only chunks it may drop are zero-length ones.
 - **Proxy hints.** The transport sets `X-Accel-Buffering: no` and `Cache-Control: no-cache, no-transform` on SSE responses. These reach the client only because `fromWebResponse` copies the full header set through `headersToPlain` — don't switch it to an allowlist of known headers.
 
-Request `Content-Type` is validated by parsed media type, not substring match, so `application/json` and `application/json; charset=utf-8` both pass but a comma-joined duplicate header 415s.
+Request `Content-Type` validation is handled by `@modelcontextprotocol/server` on the Web `Request` handed to it by `toWebRequest`.
 
 `src/scrypted.ts` is a thin `getComponent(name)` wrapper around `sdk.systemManager.getComponent(...)` plus re-exports of `systemManager` / `deviceManager` / `mediaManager`. Tools that previously went through `@scrypted/client` now hit the SDK directly.
 
