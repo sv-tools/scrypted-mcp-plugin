@@ -62,7 +62,7 @@ Ask your assistant something like:
 | Area                    | For example                                                     | Changes things? |
 |-------------------------|-----------------------------------------------------------------|-----------------|
 | Plugins                 | List, inspect, install, update, reload, read or change storage  | Some tools      |
-| Devices                 | List devices, read their state, call device methods             | Some tools      |
+| Devices                 | List devices, read state, grab camera snapshots, call methods   | Some tools      |
 | Logs & alerts           | Read server logs and alerts, clear them                         | Some tools      |
 | Server administration   | Version and environment, restart, update, edit `.env`           | Some tools      |
 | Users                   | List, add, or remove Scrypted users                             | Some tools      |
@@ -98,7 +98,8 @@ as potentially destructive. The full list is in the [tool reference](#tool-refer
 
 - `list_devices` — All devices. Filter by interface / type / name substring.
 - `get_device` — Snapshot every state property on a device.
-- `call_device_method` — Invoke a method on a device (`turnOn`, `setBrightness`, `getSettings`, …).
+- `get_snapshot` — Capture a still snapshot from a `Camera` device as an image (read-only; supports optional `width`, `height`, and `timeout`).
+- `call_device_method` — Invoke a method on a device (`turnOn`, `setBrightness`, `getSettings`, …). Image `MediaObject` results are returned as MCP image content; non-image `MediaObject`s return `{ mediaObject: true, mimeType, ... }`.
 
 ### Logs & alerts
 
