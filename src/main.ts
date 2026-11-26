@@ -60,6 +60,8 @@ import {
     callDeviceMethodInput,
     getDevice,
     getDeviceInput,
+    getSnapshot,
+    getSnapshotInput,
     listDevices,
     listDevicesInput,
 } from './tools/devices';
@@ -128,8 +130,9 @@ import { addUser, addUserInput, listUsers, listUsersInput, removeUser, removeUse
 // Wrapper around tool handlers. Two responsibilities:
 //   1. Catch thrown errors and surface them as structured MCP error responses (`isError: true`).
 //   2. For most tools, JSON-stringify the return value so the LLM gets a single text block.
-//      Tools that need to return multi-block content (like backup with its base64 ZIP blob)
-//      opt out via `{ rawContent: true }` and return the full MCP `content` array themselves.
+//      Tools that need to return multi-block or binary content (create_backup, get_snapshot,
+//      call_device_method) opt out via `{ rawContent: true }` and return the full MCP `content`
+//      array themselves.
 //
 // We dropped the auto-retry-on-transient-disconnect path that the stdio version had: now
 // that we run inside the Scrypted process there's no socket between us and the runtime to
@@ -175,7 +178,7 @@ function createMcpServer(
             instructions: [
                 'This MCP server runs inside a Scrypted plugin and controls the same Scrypted server (https://scrypted.app).',
                 'Inspect: list_plugins / get_plugin_info / get_plugin_stats (per-plugin CPU and memory, including child processes like ffmpeg) / get_logs / get_server_info / npm_info.',
-                'Devices: list_devices / get_device / call_device_method (any RPC method); resolve nativeIds with get_id_for_native_id.',
+                'Devices: list_devices / get_device / get_snapshot (read-only camera snapshot) / call_device_method (any RPC method); resolve nativeIds with get_id_for_native_id.',
                 'Plugin lifecycle: reload_plugin (after code changes), install_plugin, update_plugins, kill_plugin, disconnect_clients, read_console, clear_console.',
                 'Device config: get_storage / set_storage (KV storage), set_mixins, rename_device_id.',
                 'Server admin: restart_server, update_server, get_dotenv / set_dotenv, list_users / add_user / remove_user.',
@@ -640,16 +643,32 @@ function createMcpServer(
     );
 
     server.registerTool(
+        'get_snapshot',
+        {
+            description:
+                'Capture a still snapshot from a Camera device and return it as an image (plus a JSON summary with device id, name, mimeType, and byte size). Prefer this over calling takePicture via call_device_method: it is read-only and supports optional width/height resizing.',
+            inputSchema: getSnapshotInput,
+            annotations: {
+                title: 'Get camera snapshot',
+                readOnlyHint: true,
+                destructiveHint: false,
+                openWorldHint: false,
+            },
+        },
+        wrap(getSnapshot, { rawContent: true }),
+    );
+
+    server.registerTool(
         'call_device_method',
         {
             description:
-                "Invoke a method on a device (e.g. turnOn, setBrightness, getSettings). The available methods follow from the device's `interfaces` — call get_device first if unsure. May read or mutate depending on the method. Returns the JSON-serialized result.",
+                "Invoke a method on a device (e.g. turnOn, setBrightness, getSettings). The available methods follow from the device's `interfaces` — call get_device first if unsure. May read or mutate depending on the method. Returns the JSON-serialized result; image MediaObjects (e.g. takePicture, getVideoClipThumbnail) are converted and returned as MCP image content, and non-image MediaObjects return `{ mediaObject: true, mimeType, ... }`. For read-only camera snapshots, prefer get_snapshot.",
             inputSchema: callDeviceMethodInput,
             annotations: {
                 title: 'Call device method',
             },
         },
-        wrap(callDeviceMethod),
+        wrap(callDeviceMethod, { rawContent: true }),
     );
 
     server.registerTool(

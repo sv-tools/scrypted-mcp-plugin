@@ -85,7 +85,7 @@ Token-lifetime constants and bounds (`DEFAULT_ACCESS_TOKEN_TTL_SEC`, `ACCESS_TOK
 
 Each Scrypted runtime component (`logger`, `plugins`, `users`, `alerts`, `addresses`, `cors`, `backup`, `cluster-fork`, `service-control`, `info`, `env-control`) gets one file in `src/tools/`. Every file exports paired `<name>Input` (Zod schema) + `<name>` handler. New tools are wired in `src/main.ts#createMcpServer` via `server.registerTool(name, { description, inputSchema, annotations? }, wrap(handler))`.
 
-`wrap()` catches thrown errors and surfaces them as structured MCP error responses (`isError: true`). It also JSON-stringifies the return value into a single text content block. Tools that need multi-block content (currently just `create_backup` with its base64 ZIP blob) opt out with `wrap(handler, { rawContent: true })` and return the full MCP `content` array themselves.
+`wrap()` catches thrown errors and surfaces them as structured MCP error responses (`isError: true`). It also JSON-stringifies the return value into a single text content block. Tools that need multi-block or binary content (`create_backup`, `get_snapshot`, `call_device_method`) opt out with `wrap(handler, { rawContent: true })` and return the full MCP `content` array themselves.
 
 There is no auto-retry layer. The stdio version had one (`isTransientConnectionError`) because the engine.io socket between the MCP server and Scrypted could drop; in-process there's no socket to drop.
 
